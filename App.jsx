@@ -1,0 +1,1318 @@
+import React, { useState, useEffect } from 'react';
+import { initializeApp } from 'firebase/app';
+import { 
+  getAuth, 
+  signInAnonymously 
+} from 'firebase/auth';
+import { 
+  getFirestore, 
+  doc, 
+  setDoc, 
+  getDoc, 
+  onSnapshot, 
+  updateDoc 
+} from 'firebase/firestore';
+import { 
+  HelpCircle, 
+  Users, 
+  Play, 
+  Copy, 
+  Check, 
+  AlertTriangle,
+  Trophy,
+  RefreshCw,
+  Sparkles
+} from 'lucide-react';
+
+// --- INITIALISATION FIREBASE & HYBRIDE ---
+const firebaseConfig = typeof __firebase_config !== 'undefined' 
+  ? JSON.parse(__firebase_config) 
+  : {
+      apiKey: "demo-api-key",
+      authDomain: "demo-app.firebaseapp.com",
+      projectId: "demo-app",
+      storageBucket: "demo-app.appspot.com",
+      messagingSenderId: "123456789",
+      appId: "1:123456789:web:123456789"
+    };
+
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'tamoul-game-v2';
+
+// Canal local BroadcastChannel pour la synchronisation instantanée multi-onglets
+const channel = typeof window !== 'undefined' && window.BroadcastChannel ? new BroadcastChannel('tamoul_sync_channel') : null;
+
+// --- CONSTANTES ET UTILITAIRES ---
+const SUITS = ['♠', '♣', '♥', '♦'];
+const VALUES = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'];
+
+// Helper pour générer un paquet de 54 cartes (52 + 2 Jokers)
+const createDeck = () => {
+  const deck = [];
+  let id = 1;
+
+  SUITS.forEach(suit => {
+    const isRed = suit === '♥' || suit === '♦';
+    VALUES.forEach((val, idx) => {
+      let numericValue = idx + 1; // A=1, 2=2... 10=10
+      let isPower = false;
+      let powerType = null;
+
+      if (val === 'J' || val === 'Q' || val === 'K') {
+        if (isRed) {
+          if (val === 'K') numericValue = 0; // Roi rouge = 0
+          else if (val === 'Q') {
+            numericValue = 10;
+            isPower = true;
+            powerType = 'PEEK_OWN'; // Regarder une de ses cartes
+          } else if (val === 'J') {
+            numericValue = 10;
+            isPower = true;
+            powerType = 'SWAP'; // Echanger avec un joueur
+          }
+        } else {
+          // Figures noires = 10
+          numericValue = 10;
+        }
+      }
+
+      deck.push({
+        id: `card_${id++}`,
+        suit,
+        val,
+        isRed,
+        numericValue,
+        isPower,
+        powerType
+      });
+    });
+  });
+
+  // 2 Jokers
+  deck.push({ id: `card_${id++}`, suit: '🃏', val: 'Joker', isRed: true, numericValue: 0, isPower: false });
+  deck.push({ id: `card_${id++}`, suit: '🃏', val: 'Joker', isRed: false, numericValue: 0, isPower: false });
+
+  // Mélange de Fisher-Yates
+  for (let i = deck.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [deck[i], deck[j]] = [deck[j], deck[i]];
+  }
+
+  return deck;
+};
+
+// Valeur nominale pour comparaison de cartes identiques ("couper")
+const getMatchValue = (card) => {
+  if (!card) return null;
+  return card.val;
+};
+
+// Obtenir la valeur finale pour le calcul du score (prise en compte des pénalités Dames/Valets rouges à la fin)
+const getFinalCardScore = (card) => {
+  if (!card) return 0;
+  // Dames Rouges ou Valets Rouges restés dans la main valent 10 points
+  if (card.isRed && (card.val === 'Q' || card.val === 'J')) {
+    return 10;
+  }
+  return card.numericValue;
+};
+
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [playerName, setPlayerName] = useState('');
+  const [roomId, setRoomId] = useState('');
+  const [inRoom, setInRoom] = useState(false);
+  const [roomData, setRoomData] = useState(null);
+
+  // Modales et UI
+  const [showRules, setShowRules] = useState(false);
+  const [errorMessage, setErrorMessage] = useState('');
+  const [copiedCode, setCopiedCode] = useState(false);
+  const [actionNotification, setActionNotification] = useState('');
+
+  // États locaux de phases de jeu
+  const [peekState, setPeekState] = useState({ active: false, countLeft: 2, selectedCards: [] });
+  const [powerState, setPowerState] = useState({ type: null, step: 0, sourceCard: null, targetPlayerId: null, targetCardIndex: null });
+  const [peekedCardModal, setPeekedCardModal] = useState(null);
+
+  // Authentification anonyme au démarrage
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        await signInAnonymously(auth);
+      } catch (err) {
+        console.warn("Connexion anonyme Firebase non disponible, fallback local activé", err);
+      }
+    };
+    initAuth();
+
+    const unsubscribe = onAuthStateChanged(auth, (usr) => {
+      if (usr) setUser(usr);
+      else setUser({ uid: `user_${Math.random().toString(36).substring(2, 9)}` });
+    });
+
+    return () => unsubscribe();
+  }, []);
+
+  // Écouteur Firestore et BroadcastChannel pour la Room
+  useEffect(() => {
+    if (!user || !roomId || !inRoom) return;
+
+    // Écouteur Firestore (appareil distant)
+    const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomId);
+    const unsubscribe = onSnapshot(roomRef, (snapshot) => {
+      if (snapshot.exists()) {
+        const data = snapshot.data();
+        setRoomData(data);
+        if (data.lastAction) {
+          setActionNotification(data.lastAction);
+        }
+      }
+    }, (error) => {
+      console.warn("Mise à jour en mode local/broadcast uniquement:", error);
+    });
+
+    // Écouteur BroadcastChannel (multi-onglets instantané)
+    const handleBroadcastMessage = (event) => {
+      if (event.data && event.data.roomId === roomId && event.data.roomData) {
+        setRoomData(event.data.roomData);
+        if (event.data.roomData.lastAction) {
+          setActionNotification(event.data.roomData.lastAction);
+        }
+      }
+    };
+
+    if (channel) {
+      channel.addEventListener('message', handleBroadcastMessage);
+    }
+
+    return () => {
+      unsubscribe();
+      if (channel) {
+        channel.removeEventListener('message', handleBroadcastMessage);
+      }
+    };
+  }, [user, roomId, inRoom]);
+
+  // Fonction centrale de synchronisation de salon (Firebase + Broadcast)
+  const broadcastAndSaveRoomData = async (newRoomData) => {
+    setRoomData(newRoomData);
+    if (newRoomData.lastAction) {
+      setActionNotification(newRoomData.lastAction);
+    }
+
+    // Synchronisation en temps réel via BroadcastChannel (onglets du même navigateur)
+    if (channel) {
+      channel.postMessage({ roomId: newRoomData.roomId, roomData: newRoomData });
+    }
+
+    // Sauvegarde Firestore
+    try {
+      const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', newRoomData.roomId);
+      await setDoc(roomRef, newRoomData, { merge: true });
+    } catch (err) {
+      console.warn("Écriture réseau optionnelle non disponible:", err);
+    }
+  };
+
+  // Créer une partie
+  const handleCreateRoom = async () => {
+    if (!playerName.trim()) {
+      setErrorMessage("Veuillez entrer un pseudo.");
+      return;
+    }
+
+    const currentUserId = user?.uid || `user_${Math.random().toString(36).substring(2, 9)}`;
+    const newRoomId = Math.random().toString(36).substring(2, 8).toUpperCase();
+
+    const initialRoomState = {
+      roomId: newRoomId,
+      hostId: currentUserId,
+      gameState: 'LOBBY',
+      players: {
+        [currentUserId]: {
+          id: currentUserId,
+          name: playerName.trim(),
+          cards: [],
+          hasPeeked: false,
+          score: 0
+        }
+      },
+      playerOrder: [currentUserId],
+      currentTurnIndex: 0,
+      deck: [],
+      discardPile: [],
+      drawnCard: null,
+      drawnFrom: null,
+      tamoulCalledBy: null,
+      finalRoundTurnsLeft: -1,
+      lastAction: `${playerName.trim()} a créé le salon ${newRoomId}.`
+    };
+
+    await broadcastAndSaveRoomData(initialRoomState);
+    setRoomId(newRoomId);
+    setInRoom(true);
+    setErrorMessage('');
+  };
+
+  // Rejoindre une partie
+  const handleJoinRoom = async () => {
+    if (!playerName.trim()) {
+      setErrorMessage("Veuillez entrer un pseudo.");
+      return;
+    }
+    if (!roomId.trim()) {
+      setErrorMessage("Veuillez entrer un code de salon.");
+      return;
+    }
+
+    const cleanRoomId = roomId.trim().toUpperCase();
+    const currentUserId = user?.uid || `user_${Math.random().toString(36).substring(2, 9)}`;
+    let currentRoomData = null;
+
+    try {
+      const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', cleanRoomId);
+      const snap = await getDoc(roomRef);
+      if (snap.exists()) {
+        currentRoomData = snap.data();
+      }
+    } catch (e) {
+      console.warn("Mode local utilisé pour rejoindre.");
+    }
+
+    if (!currentRoomData && roomData && roomData.roomId === cleanRoomId) {
+      currentRoomData = roomData;
+    }
+
+    if (!currentRoomData) {
+      currentRoomData = {
+        roomId: cleanRoomId,
+        hostId: currentUserId,
+        gameState: 'LOBBY',
+        players: {},
+        playerOrder: [],
+        currentTurnIndex: 0,
+        deck: [],
+        discardPile: [],
+        drawnCard: null,
+        drawnFrom: null,
+        tamoulCalledBy: null,
+        finalRoundTurnsLeft: -1,
+        lastAction: `Salon ${cleanRoomId} rejoint par ${playerName.trim()}.`
+      };
+    }
+
+    if (currentRoomData.gameState !== 'LOBBY') {
+      setErrorMessage("La partie a déjà commencé.");
+      return;
+    }
+
+    if (Object.keys(currentRoomData.players).length >= 6) {
+      setErrorMessage("Le salon est complet (max 6 joueurs).");
+      return;
+    }
+
+    const updatedPlayers = {
+      ...currentRoomData.players,
+      [currentUserId]: {
+        id: currentUserId,
+        name: playerName.trim(),
+        cards: [],
+        hasPeeked: false,
+        score: 0
+      }
+    };
+
+    const updatedOrder = currentRoomData.playerOrder.includes(currentUserId)
+      ? currentRoomData.playerOrder
+      : [...currentRoomData.playerOrder, currentUserId];
+
+    const newRoomState = {
+      ...currentRoomData,
+      players: updatedPlayers,
+      playerOrder: updatedOrder,
+      lastAction: `${playerName.trim()} a rejoint le salon.`
+    };
+
+    await broadcastAndSaveRoomData(newRoomState);
+    setRoomId(cleanRoomId);
+    setInRoom(true);
+    setErrorMessage('');
+  };
+
+  // Démarrer la partie
+  const handleStartGame = async () => {
+    if (!roomData || roomData.hostId !== user?.uid) return;
+    if (roomData.playerOrder.length < 2) {
+      setErrorMessage("Il faut au moins 2 joueurs pour commencer.");
+      return;
+    }
+
+    const newDeck = createDeck();
+    const players = { ...roomData.players };
+
+    // Distribuer 4 cartes à chaque joueur
+    roomData.playerOrder.forEach(pId => {
+      const handCards = newDeck.splice(0, 4).map(c => ({
+        card: c,
+        isFaceUp: false
+      }));
+      players[pId].cards = handCards;
+      players[pId].hasPeeked = false;
+    });
+
+    // Carte initiale pour la défausse
+    const initialDiscard = [newDeck.pop()];
+
+    const newRoomState = {
+      ...roomData,
+      gameState: 'PEEKING',
+      deck: newDeck,
+      discardPile: initialDiscard,
+      players,
+      currentTurnIndex: 0,
+      drawnCard: null,
+      tamoulCalledBy: null,
+      finalRoundTurnsLeft: -1,
+      lastAction: "Partie lancée ! Regardez 2 de vos cartes."
+    };
+
+    await broadcastAndSaveRoomData(newRoomState);
+  };
+
+  // Phase PEEKING : Valider avoir regardé 2 cartes
+  const handleFinishPeeking = async () => {
+    if (!roomData || !user) return;
+
+    const updatedPlayers = {
+      ...roomData.players,
+      [user.uid]: {
+        ...roomData.players[user.uid],
+        hasPeeked: true
+      }
+    };
+
+    const allPeeked = roomData.playerOrder.every(id => updatedPlayers[id].hasPeeked);
+
+    const newRoomState = {
+      ...roomData,
+      players: updatedPlayers,
+      gameState: allPeeked ? 'PLAYING' : 'PEEKING',
+      lastAction: allPeeked 
+        ? "Tous les joueurs sont prêts ! Le premier tour commence." 
+        : `${roomData.players[user.uid].name} a mémorisé ses cartes.`
+    };
+
+    await broadcastAndSaveRoomData(newRoomState);
+    setPeekState({ active: false, countLeft: 2, selectedCards: [] });
+  };
+
+  // Tour de jeu : Piocher
+  const handleDrawFromDeck = async () => {
+    if (!roomData || roomData.gameState !== 'PLAYING') return;
+    if (roomData.playerOrder[roomData.currentTurnIndex] !== user?.uid) return;
+    if (roomData.drawnCard) return;
+
+    let currentDeck = [...roomData.deck];
+    let currentDiscard = [...roomData.discardPile];
+
+    if (currentDeck.length === 0) {
+      if (currentDiscard.length <= 1) return;
+      const topDiscard = currentDiscard.pop();
+      currentDeck = [...currentDiscard];
+      for (let i = currentDeck.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [currentDeck[i], currentDeck[j]] = [currentDeck[j], currentDeck[i]];
+      }
+      currentDiscard = [topDiscard];
+    }
+
+    const drawnCard = currentDeck.pop();
+
+    const newRoomState = {
+      ...roomData,
+      deck: currentDeck,
+      discardPile: currentDiscard,
+      drawnCard: drawnCard,
+      drawnFrom: 'DECK',
+      lastAction: `${roomData.players[user.uid].name} a pioché une carte.`
+    };
+
+    await broadcastAndSaveRoomData(newRoomState);
+  };
+
+  // Échanger la carte piochée avec une de sa main
+  const handleSwapDrawnWithHand = async (handIndex) => {
+    if (!roomData || !roomData.drawnCard) return;
+    if (roomData.playerOrder[roomData.currentTurnIndex] !== user?.uid) return;
+
+    const myPlayer = roomData.players[user.uid];
+    const oldCardObj = myPlayer.cards[handIndex];
+
+    const newHand = [...myPlayer.cards];
+    newHand[handIndex] = { card: roomData.drawnCard, isFaceUp: false };
+
+    const newDiscard = [...roomData.discardPile, oldCardObj.card];
+
+    const updatedPlayers = {
+      ...roomData.players,
+      [user.uid]: {
+        ...myPlayer,
+        cards: newHand
+      }
+    };
+
+    const newRoomState = {
+      ...roomData,
+      players: updatedPlayers,
+      discardPile: newDiscard,
+      drawnCard: null,
+      drawnFrom: null
+    };
+
+    await broadcastAndSaveRoomData(newRoomState);
+
+    if (oldCardObj.card.isPower) {
+      triggerPowerProcess(oldCardObj.card);
+    } else {
+      nextTurn(newRoomState);
+    }
+  };
+
+  // Défausser directement la carte piochée
+  const handleDiscardDrawn = async () => {
+    if (!roomData || !roomData.drawnCard) return;
+    if (roomData.playerOrder[roomData.currentTurnIndex] !== user?.uid) return;
+
+    const discarded = roomData.drawnCard;
+    const newDiscard = [...roomData.discardPile, discarded];
+
+    const newRoomState = {
+      ...roomData,
+      discardPile: newDiscard,
+      drawnCard: null,
+      drawnFrom: null
+    };
+
+    await broadcastAndSaveRoomData(newRoomState);
+
+    if (discarded.isPower) {
+      triggerPowerProcess(discarded);
+    } else {
+      nextTurn(newRoomState);
+    }
+  };
+
+  // Déclencher un pouvoir
+  const triggerPowerProcess = (card) => {
+    if (card.powerType === 'PEEK_OWN') {
+      setPowerState({ type: 'PEEK_OWN', step: 1, sourceCard: card, targetPlayerId: null, targetCardIndex: null });
+    } else if (card.powerType === 'SWAP') {
+      setPowerState({ type: 'SWAP', step: 1, sourceCard: card, targetPlayerId: null, targetCardIndex: null });
+    }
+  };
+
+  // Résoudre le pouvoir Dame Rouge
+  const resolvePeekPower = (cardIndex) => {
+    const card = roomData.players[user.uid].cards[cardIndex].card;
+    setPeekedCardModal({
+      card: card,
+      title: "Pouvoir Dame Rouge (Regarder une carte)",
+      subtitle: "Vous seul pouvez voir cette carte."
+    });
+    setPowerState({ type: null, step: 0, sourceCard: null, targetPlayerId: null, targetCardIndex: null });
+    nextTurn();
+  };
+
+  // Résoudre le pouvoir Valet Rouge
+  const resolveSwapPower = async (myIndex, targetPlayerId, targetIndex) => {
+    if (!roomData) return;
+
+    const myHand = [...roomData.players[user.uid].cards];
+    const targetHand = [...roomData.players[targetPlayerId].cards];
+
+    const myCard = myHand[myIndex].card;
+    const targetCard = targetHand[targetIndex].card;
+
+    myHand[myIndex] = { card: targetCard, isFaceUp: false };
+    targetHand[targetIndex] = { card: myCard, isFaceUp: false };
+
+    const updatedPlayers = {
+      ...roomData.players,
+      [user.uid]: { ...roomData.players[user.uid], cards: myHand },
+      [targetPlayerId]: { ...roomData.players[targetPlayerId], cards: targetHand }
+    };
+
+    const newRoomState = {
+      ...roomData,
+      players: updatedPlayers,
+      lastAction: `${roomData.players[user.uid].name} a utilisé le Valet Rouge pour échanger une carte avec ${roomData.players[targetPlayerId].name}.`
+    };
+
+    await broadcastAndSaveRoomData(newRoomState);
+
+    setPeekedCardModal({
+      card: targetCard,
+      title: "Pouvoir Valet Rouge (Nouvelle Carte)",
+      subtitle: `Vous avez reçu cette carte de la part de ${roomData.players[targetPlayerId].name}.`
+    });
+
+    setPowerState({ type: null, step: 0, sourceCard: null, targetPlayerId: null, targetCardIndex: null });
+    nextTurn(newRoomState);
+  };
+
+  // Passage au tour suivant
+  const nextTurn = async (currentState = roomData) => {
+    if (!currentState) return;
+
+    let nextIndex = (currentState.currentTurnIndex + 1) % currentState.playerOrder.length;
+    let newTurnsLeft = currentState.finalRoundTurnsLeft;
+
+    if (currentState.tamoulCalledBy !== null) {
+      newTurnsLeft -= 1;
+      if (newTurnsLeft <= 0) {
+        finishGame(currentState);
+        return;
+      }
+    }
+
+    const newRoomState = {
+      ...currentState,
+      currentTurnIndex: nextIndex,
+      finalRoundTurnsLeft: newTurnsLeft,
+      lastAction: `Tour à ${currentState.players[currentState.playerOrder[nextIndex]].name}.`
+    };
+
+    await broadcastAndSaveRoomData(newRoomState);
+  };
+
+  // Action réflexe / Couper
+  const handleReflexCut = async (playerHandIndex) => {
+    if (!roomData || roomData.gameState !== 'PLAYING') return;
+    if (roomData.discardPile.length === 0) return;
+
+    const topDiscard = roomData.discardPile[roomData.discardPile.length - 1];
+    const playerHand = roomData.players[user.uid].cards;
+    const playedCardObj = playerHand[playerHandIndex];
+
+    if (!playedCardObj) return;
+
+    if (getMatchValue(playedCardObj.card) === getMatchValue(topDiscard)) {
+      const newHand = playerHand.filter((_, idx) => idx !== playerHandIndex);
+      const newDiscard = [...roomData.discardPile, playedCardObj.card];
+
+      const newRoomState = {
+        ...roomData,
+        players: {
+          ...roomData.players,
+          [user.uid]: { ...roomData.players[user.uid], cards: newHand }
+        },
+        discardPile: newDiscard,
+        lastAction: `⚡ RÉFLEXE ! ${roomData.players[user.uid].name} a coupé avec succès ! (-1 carte)`
+      };
+
+      await broadcastAndSaveRoomData(newRoomState);
+    } else {
+      let currentDeck = [...roomData.deck];
+      let penaltyCard = null;
+
+      if (currentDeck.length > 0) {
+        penaltyCard = currentDeck.pop();
+      }
+
+      const updatedHand = [...playerHand];
+      updatedHand[playerHandIndex] = { ...playedCardObj, isFaceUp: true };
+
+      if (penaltyCard) {
+        updatedHand.push({ card: penaltyCard, isFaceUp: false });
+      }
+
+      const newRoomState = {
+        ...roomData,
+        players: {
+          ...roomData.players,
+          [user.uid]: { ...roomData.players[user.uid], cards: updatedHand }
+        },
+        deck: currentDeck,
+        lastAction: `❌ ERREUR RÉFLEXE ! ${roomData.players[user.uid].name} s'est trompé. Sa carte est révélée et il écope d'une pénalité !`
+      };
+
+      await broadcastAndSaveRoomData(newRoomState);
+
+      if (penaltyCard) {
+        setPeekedCardModal({
+          card: penaltyCard,
+          title: "Pénalité Réflexe",
+          subtitle: "Vous avez fait une erreur. Voici la carte de pénalité ajoutée à votre jeu :"
+        });
+      }
+    }
+  };
+
+  // Bouton TAMOUL
+  const handleCallTamoul = async () => {
+    if (!roomData || roomData.gameState !== 'PLAYING') return;
+    if (roomData.tamoulCalledBy !== null) return;
+
+    const remainingTurns = roomData.playerOrder.length - 1;
+
+    const newRoomState = {
+      ...roomData,
+      tamoulCalledBy: user.uid,
+      finalRoundTurnsLeft: remainingTurns,
+      lastAction: `🔔 TAMOUL ! ${roomData.players[user.uid].name} a annoncé TAMOUL ! Dernier tour pour les autres.`
+    };
+
+    await broadcastAndSaveRoomData(newRoomState);
+  };
+
+  // Fin de la partie et calcul du vainqueur
+  const finishGame = async (currentState = roomData) => {
+    if (!currentState) return;
+
+    const players = { ...currentState.players };
+    let lowestScore = Infinity;
+    let winnerId = null;
+
+    Object.keys(players).forEach(pId => {
+      const player = players[pId];
+      let total = 0;
+      player.cards.forEach(c => {
+        total += getFinalCardScore(c.card);
+      });
+      player.score = total;
+      if (total < lowestScore) {
+        lowestScore = total;
+        winnerId = pId;
+      }
+    });
+
+    const newRoomState = {
+      ...currentState,
+      players,
+      gameState: 'GAME_OVER',
+      winnerId,
+      lastAction: `🏆 FIN DE LA PARTIE ! Le gagnant est ${players[winnerId]?.name} avec ${lowestScore} points !`
+    };
+
+    await broadcastAndSaveRoomData(newRoomState);
+  };
+
+  const copyRoomCode = () => {
+    navigator.clipboard.writeText(roomId);
+    setCopiedCode(true);
+    setTimeout(() => setCopiedCode(false), 2000);
+  };
+
+  // Rendu Visuel des Cartes
+  const renderCard = (card, isFaceUp = true, onClick = null, extraClasses = "") => {
+    if (!card) return null;
+
+    if (!isFaceUp) {
+      return (
+        <div 
+          onClick={onClick}
+          className={`w-16 h-24 sm:w-20 sm:h-28 rounded-lg bg-gradient-to-br from-indigo-800 to-purple-900 border-2 border-indigo-400/50 shadow-md flex items-center justify-center cursor-pointer transform hover:-translate-y-1 transition duration-200 relative overflow-hidden select-none ${extraClasses}`}
+        >
+          <div className="absolute inset-0 opacity-20 bg-[radial-gradient(ellipse_at_center,_var(--tw-gradient-stops))] from-yellow-300 via-red-500 to-indigo-900"></div>
+          <div className="w-10 h-16 border border-indigo-300/30 rounded flex items-center justify-center">
+            <span className="text-xl text-indigo-200/50 font-bold">🎴</span>
+          </div>
+        </div>
+      );
+    }
+
+    const isRed = card.isRed;
+    const colorClass = isRed ? 'text-red-600' : 'text-gray-900';
+
+    return (
+      <div 
+        onClick={onClick}
+        className={`w-16 h-24 sm:w-20 sm:h-28 rounded-lg bg-white border-2 border-gray-300 shadow-md flex flex-col justify-between p-1.5 sm:p-2 cursor-pointer transform hover:-translate-y-1 transition duration-200 select-none relative ${colorClass} ${extraClasses}`}
+      >
+        <div className="flex justify-between items-start leading-none">
+          <span className="font-bold text-sm sm:text-base">{card.val}</span>
+          <span className="text-xs sm:text-sm">{card.suit}</span>
+        </div>
+        
+        <div className="text-center text-xl sm:text-2xl font-black my-auto">
+          {card.suit}
+        </div>
+
+        <div className="flex justify-between items-end leading-none rotate-180">
+          <span className="font-bold text-sm sm:text-base">{card.val}</span>
+          <span className="text-xs sm:text-sm">{card.suit}</span>
+        </div>
+
+        {card.isPower && (
+          <div className="absolute bottom-1 right-1 bg-yellow-400 text-gray-900 text-[9px] font-bold px-1 rounded-full border border-yellow-600">
+            {card.val === 'Q' ? '👁️' : '🔄'}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  // Rules Modal
+  const RulesModal = () => (
+    <div className="fixed inset-0 bg-black/75 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+      <div className="bg-slate-900 border border-slate-700 text-slate-100 max-w-2xl w-full max-h-[90vh] rounded-2xl flex flex-col overflow-hidden shadow-2xl">
+        <div className="p-4 sm:p-6 bg-slate-800 border-b border-slate-700 flex justify-between items-center">
+          <h2 className="text-xl sm:text-2xl font-extrabold text-amber-400 flex items-center gap-2">
+            <HelpCircle className="w-6 h-6 text-amber-400" /> Règles du Jeu : TAMOUL
+          </h2>
+          <button 
+            onClick={() => setShowRules(false)}
+            className="text-slate-400 hover:text-white bg-slate-700 hover:bg-slate-600 rounded-full w-8 h-8 flex items-center justify-center transition"
+          >
+            ✕
+          </button>
+        </div>
+
+        <div className="p-4 sm:p-6 overflow-y-auto space-y-4 text-sm sm:text-base leading-relaxed text-slate-300">
+          <div className="bg-amber-500/10 border-l-4 border-amber-500 p-3 rounded text-amber-200 font-medium">
+            🎯 <strong>Objectif :</strong> Obtenir le score le plus FAIBLE possible (ou n'avoir plus aucune carte) lorsqu'un joueur annonce "TAMOUL".
+          </div>
+
+          <div>
+            <h3 className="text-lg font-bold text-white mb-2 border-b border-slate-700 pb-1">🎴 Mise en place</h3>
+            <p>Chaque joueur reçoit <strong>4 cartes face cachée</strong>. Au tout début de la partie, chaque joueur consulte <strong>seulement 2 de ses cartes</strong> au choix pour les mémoriser. Ensuite, toutes les cartes restent cachées !</p>
+          </div>
+
+          <div>
+            <h3 className="text-lg font-bold text-white mb-2 border-b border-slate-700 pb-1">🔢 Valeur des Cartes & Score</h3>
+            <ul className="list-disc list-inside space-y-1">
+              <li><strong>Chiffres (1 à 10) :</strong> Valeur nominale (1=1 pt, 7=7 pts, etc.).</li>
+              <li><strong>Figures noires (Valet, Dame, Roi ♠/♣) :</strong> 10 points.</li>
+              <li><strong>Jokers & Rois Rouges (♥/♦) :</strong> <span className="text-green-400 font-bold">0 point</span>.</li>
+              <li><strong>⚠️ Dames & Valets Rouges restés en main à la fin :</strong> <span className="text-red-400 font-bold">10 points</span> chacun.</li>
+            </ul>
+          </div>
+
+          <div>
+            <h3 className="text-lg font-bold text-white mb-2 border-b border-slate-700 pb-1">✨ Pouvoirs Spéciaux</h3>
+            <ul className="list-disc list-inside space-y-2">
+              <li><strong className="text-pink-400">Dame Rouge (♥/♦) :</strong> Permet de regarder secrètement 1 carte de son propre jeu.</li>
+              <li><strong className="text-blue-400">Valet Rouge (♥/♦) :</strong> Permet d'échanger 1 de ses cartes avec celle d'un autre joueur.</li>
+            </ul>
+          </div>
+
+          <div>
+            <h3 className="text-lg font-bold text-white mb-2 border-b border-slate-700 pb-1">⚡ Action Réflexe / Couper</h3>
+            <p>Dès qu'une carte est posée sur la défausse, <strong>n'importe quel joueur</strong> possédant une carte du <strong>MÊME CHIFFRE / VALEUR</strong> peut la poser immédiatement !</p>
+            <p className="mt-1 text-red-300 text-xs sm:text-sm bg-red-950/40 p-2 rounded border border-red-800/40">
+              ⚠️ <strong>Pénalité d'erreur :</strong> Si vous vous trompez, votre carte est remise <strong>face visible</strong> sur votre plateau + vous piocher une pénalité.
+            </p>
+          </div>
+        </div>
+
+        <div className="p-4 bg-slate-800 border-t border-slate-700 flex justify-end">
+          <button 
+            onClick={() => setShowRules(false)}
+            className="bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold px-6 py-2.5 rounded-xl transition shadow-lg"
+          >
+            Fermer
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+
+  // ECRAN D'ACCUEIL
+  if (!inRoom) {
+    return (
+      <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col items-center justify-center p-4 font-sans relative overflow-hidden">
+        {showRules && <RulesModal />}
+
+        <div className="w-full max-w-md bg-slate-900/90 border border-slate-800 backdrop-blur-md rounded-3xl p-6 sm:p-8 shadow-2xl z-10 flex flex-col items-center">
+          <div className="flex items-center gap-3 mb-2">
+            <span className="text-4xl">🎴</span>
+            <h1 className="text-3xl sm:text-4xl font-black bg-gradient-to-r from-amber-400 via-emerald-400 to-teal-200 bg-clip-text text-transparent">
+              TAMOUL
+            </h1>
+          </div>
+          <p className="text-xs sm:text-sm text-slate-400 mb-6 text-center">
+            Le jeu de cartes stratégique en ligne (2 à 6 joueurs)
+          </p>
+
+          {errorMessage && (
+            <div className="w-full bg-red-500/20 border border-red-500/50 text-red-200 text-xs sm:text-sm p-3 rounded-xl mb-4 flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4 shrink-0" />
+              <span>{errorMessage}</span>
+            </div>
+          )}
+
+          <div className="w-full space-y-4">
+            <div>
+              <label className="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-1">
+                Votre Pseudo
+              </label>
+              <input
+                type="text"
+                maxLength={15}
+                placeholder="Ex: Alex"
+                value={playerName}
+                onChange={(e) => setPlayerName(e.target.value)}
+                className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 text-white placeholder-slate-500 focus:outline-none focus:border-amber-400 font-medium transition"
+              />
+            </div>
+
+            <div className="pt-2 border-t border-slate-800">
+              <button
+                onClick={handleCreateRoom}
+                className="w-full bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 text-slate-950 font-bold py-3.5 rounded-xl transition shadow-lg flex items-center justify-center gap-2"
+              >
+                <Sparkles className="w-5 h-5" /> Créer un nouveau salon
+              </button>
+            </div>
+
+            <div className="relative flex py-2 items-center">
+              <div className="flex-grow border-t border-slate-800"></div>
+              <span className="flex-shrink mx-4 text-xs text-slate-500 font-semibold uppercase">OU REJOINDRER</span>
+              <div className="flex-grow border-t border-slate-800"></div>
+            </div>
+
+            <div className="flex gap-2">
+              <input
+                type="text"
+                placeholder="CODE SALON"
+                value={roomId}
+                onChange={(e) => setRoomId(e.target.value.toUpperCase())}
+                className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 text-white placeholder-slate-500 focus:outline-none focus:border-amber-400 uppercase font-mono tracking-wider transition text-center"
+              />
+              <button
+                onClick={handleJoinRoom}
+                className="bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold px-6 py-3 rounded-xl transition shadow-lg shrink-0 flex items-center justify-center"
+              >
+                Rejoindre
+              </button>
+            </div>
+          </div>
+
+          <div className="mt-8 flex gap-4 text-xs text-slate-400">
+            <button
+              onClick={() => setShowRules(true)}
+              className="flex items-center gap-1.5 hover:text-amber-400 transition"
+            >
+              <HelpCircle className="w-4 h-4" /> Lire les règles
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ATTENTE EN SALON
+  if (roomData && roomData.gameState === 'LOBBY') {
+    const isHost = roomData.hostId === user?.uid;
+    const playerList = Object.values(roomData.players);
+
+    return (
+      <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col items-center justify-center p-4 font-sans">
+        {showRules && <RulesModal />}
+
+        <div className="w-full max-w-lg bg-slate-900 border border-slate-800 rounded-3xl p-6 sm:p-8 shadow-2xl">
+          <div className="flex justify-between items-center mb-6">
+            <h2 className="text-xl font-bold text-white flex items-center gap-2">
+              <Users className="w-5 h-5 text-emerald-400" /> Salon d'attente
+            </h2>
+            <button
+              onClick={() => setShowRules(true)}
+              className="text-xs bg-slate-800 hover:bg-slate-700 text-amber-400 px-3 py-1.5 rounded-lg border border-slate-700 flex items-center gap-1"
+            >
+              <HelpCircle className="w-3.5 h-3.5" /> Règles
+            </button>
+          </div>
+
+          <div className="bg-slate-800/80 border border-slate-700 rounded-2xl p-4 mb-6 text-center">
+            <p className="text-xs text-slate-400 mb-1">Code du salon à partager :</p>
+            <div className="flex items-center justify-center gap-3">
+              <span className="text-3xl font-black tracking-widest text-amber-400 font-mono">
+                {roomId}
+              </span>
+              <button
+                onClick={copyRoomCode}
+                className="p-2 bg-slate-700 hover:bg-slate-600 rounded-xl text-slate-200 transition"
+                title="Copier le code"
+              >
+                {copiedCode ? <Check className="w-5 h-5 text-green-400" /> : <Copy className="w-5 h-5" />}
+              </button>
+            </div>
+          </div>
+
+          <div className="mb-6">
+            <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-3">
+              Joueurs connectés ({playerList.length}/6)
+            </h3>
+            <div className="space-y-2">
+              {playerList.map((p) => (
+                <div
+                  key={p.id}
+                  className="flex items-center justify-between bg-slate-800/50 border border-slate-700/50 px-4 py-3 rounded-xl"
+                >
+                  <span className="font-semibold text-slate-200 flex items-center gap-2">
+                    👤 {p.name} {p.id === roomData.hostId && <span className="text-xs bg-amber-500/20 text-amber-400 px-2 py-0.5 rounded-full border border-amber-500/30">Hôte</span>}
+                  </span>
+                  {p.id === user?.uid && (
+                    <span className="text-xs text-emerald-400 font-medium">Vous</span>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {isHost ? (
+            <button
+              onClick={handleStartGame}
+              disabled={playerList.length < 2}
+              className={`w-full py-3.5 rounded-xl font-bold flex items-center justify-center gap-2 shadow-lg transition ${
+                playerList.length >= 2
+                  ? 'bg-emerald-500 hover:bg-emerald-400 text-slate-950'
+                  : 'bg-slate-800 text-slate-500 cursor-not-allowed'
+              }`}
+            >
+              <Play className="w-5 h-5 fill-current" />
+              {playerList.length >= 2 ? 'Lancer la partie' : 'En attente de 2 joueurs minimum...'}
+            </button>
+          ) : (
+            <div className="text-center p-3 bg-slate-800/40 rounded-xl text-slate-400 text-sm italic border border-slate-800">
+              En attente que l'hôte lance la partie...
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // PLATEAU PRINCIPAL
+  const myPlayer = roomData?.players[user?.uid];
+  const isMyTurn = roomData?.playerOrder[roomData.currentTurnIndex] === user?.uid;
+  const currentTurnPlayerName = roomData?.players[roomData.playerOrder[roomData.currentTurnIndex]]?.name;
+  const topDiscardCard = roomData?.discardPile[roomData.discardPile.length - 1];
+
+  const togglePeekCardSelection = (index) => {
+    if (roomData.gameState !== 'PEEKING') return;
+    if (myPlayer?.hasPeeked) return;
+
+    setPeekState(prev => {
+      const alreadySelected = prev.selectedCards.includes(index);
+      if (alreadySelected) {
+        return {
+          ...prev,
+          selectedCards: prev.selectedCards.filter(i => i !== index)
+        };
+      } else if (prev.selectedCards.length < 2) {
+        return {
+          ...prev,
+          selectedCards: [...prev.selectedCards, index]
+        };
+      }
+      return prev;
+    });
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans select-none overflow-x-hidden">
+      {showRules && <RulesModal />}
+
+      {peekedCardModal && (
+        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-700 rounded-3xl p-6 max-w-sm w-full text-center shadow-2xl flex flex-col items-center">
+            <h3 className="text-lg font-bold text-amber-400 mb-1">{peekedCardModal.title}</h3>
+            <p className="text-xs text-slate-400 mb-6">{peekedCardModal.subtitle}</p>
+
+            <div className="mb-6 transform scale-125">
+              {renderCard(peekedCardModal.card, true)}
+            </div>
+
+            <button
+              onClick={() => setPeekedCardModal(null)}
+              className="w-full bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold py-2.5 rounded-xl transition"
+            >
+              Compris / Masquer
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* HEADER */}
+      <header className="bg-slate-900 border-b border-slate-800 px-4 py-3 flex items-center justify-between z-10">
+        <div className="flex items-center gap-3">
+          <span className="text-2xl">🎴</span>
+          <div>
+            <h1 className="text-lg font-black text-amber-400 leading-none">TAMOUL</h1>
+            <span className="text-[10px] font-mono text-slate-400">Salon: {roomId}</span>
+          </div>
+        </div>
+
+        {actionNotification && (
+          <div className="hidden md:flex items-center gap-2 bg-indigo-950/80 border border-indigo-700/50 text-indigo-200 text-xs px-3 py-1.5 rounded-full animate-fade-in max-w-md truncate">
+            <Sparkles className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+            <span className="truncate">{actionNotification}</span>
+          </div>
+        )}
+
+        <button
+          onClick={() => setShowRules(true)}
+          className="text-xs bg-slate-800 hover:bg-slate-700 text-amber-400 px-3 py-1.5 rounded-xl border border-slate-700 flex items-center gap-1 font-semibold"
+        >
+          <HelpCircle className="w-4 h-4" /> Règles
+        </button>
+      </header>
+
+      {/* BANNIÈRE TOUR */}
+      <div className="bg-slate-900/50 border-b border-slate-800/80 px-4 py-2 flex items-center justify-between text-xs sm:text-sm">
+        <div className="flex items-center gap-2">
+          {roomData?.gameState === 'PEEKING' ? (
+            <span className="text-amber-300 font-medium">
+              🔍 Mémorisation : Choisissez 2 cartes à consulter au début.
+            </span>
+          ) : roomData?.gameState === 'GAME_OVER' ? (
+            <span className="text-emerald-400 font-bold">🏆 Partie terminée !</span>
+          ) : (
+            <div className="flex items-center gap-2">
+              <span className="text-slate-400">Tour actuel :</span>
+              <span className={`font-bold px-2 py-0.5 rounded-md ${isMyTurn ? 'bg-amber-400 text-slate-950 animate-pulse' : 'bg-slate-800 text-amber-400'}`}>
+                {isMyTurn ? "C'est votre tour !" : currentTurnPlayerName}
+              </span>
+            </div>
+          )}
+        </div>
+
+        {roomData?.tamoulCalledBy && (
+          <div className="bg-red-500/20 border border-red-500/40 text-red-300 px-2.5 py-0.5 rounded-full text-xs font-bold flex items-center gap-1">
+            🔔 TAMOUL Annoncé !
+          </div>
+        )}
+      </div>
+
+      {/* PLATEAU */}
+      <div className="flex-1 bg-gradient-to-b from-emerald-950 via-slate-950 to-slate-950 p-4 flex flex-col justify-between items-center relative overflow-hidden">
+        
+        {/* AUTRES JOUEURS */}
+        <div className="w-full max-w-5xl flex flex-wrap justify-center gap-4 sm:gap-6 my-2">
+          {roomData?.playerOrder
+            .filter(id => id !== user?.uid)
+            .map(pId => {
+              const p = roomData.players[pId];
+              const isCurrentTurn = roomData.playerOrder[roomData.currentTurnIndex] === pId;
+              const isTargetableForSwap = powerState.type === 'SWAP' && powerState.step === 1;
+
+              return (
+                <div
+                  key={p.id}
+                  className={`bg-slate-900/80 border ${isCurrentTurn ? 'border-amber-400 ring-2 ring-amber-400/30' : 'border-slate-800'} rounded-2xl p-3 flex flex-col items-center shadow-lg transition min-w-[140px]`}
+                >
+                  <div className="text-xs font-bold text-slate-200 mb-2 flex items-center gap-1.5">
+                    <span>👤 {p.name}</span>
+                    {roomData.gameState === 'GAME_OVER' && (
+                      <span className="bg-amber-500 text-slate-950 text-[10px] px-1.5 py-0.2 rounded font-black">
+                        {p.score} pts
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="flex gap-1.5">
+                    {p.cards.map((cObj, idx) => (
+                      <div key={idx} className="relative">
+                        {renderCard(
+                          cObj.card,
+                          cObj.isFaceUp || roomData.gameState === 'GAME_OVER',
+                          isTargetableForSwap ? () => {
+                            setPowerState(prev => ({
+                              ...prev,
+                              step: 2,
+                              targetPlayerId: p.id,
+                              targetCardIndex: idx
+                            }));
+                          } : null,
+                          isTargetableForSwap ? "hover:ring-2 hover:ring-blue-400" : ""
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+        </div>
+
+        {/* PIOCHE & DÉFAUSSE */}
+        <div className="my-6 flex items-center justify-center gap-6 sm:gap-10">
+          <div className="flex flex-col items-center">
+            <span className="text-[11px] font-bold text-slate-400 mb-1 uppercase tracking-wider">
+              Pioche ({roomData?.deck?.length || 0})
+            </span>
+            {renderCard(
+              { id: 'deck_back' },
+              false,
+              (isMyTurn && roomData?.gameState === 'PLAYING' && !roomData?.drawnCard) ? handleDrawFromDeck : null,
+              (isMyTurn && roomData?.gameState === 'PLAYING' && !roomData?.drawnCard) ? "ring-4 ring-emerald-400/50 hover:scale-105" : "opacity-90"
+            )}
+          </div>
+
+          <div className="flex flex-col items-center">
+            <span className="text-[11px] font-bold text-slate-400 mb-1 uppercase tracking-wider">
+              Défausse
+            </span>
+            {topDiscardCard ? (
+              renderCard(topDiscardCard, true)
+            ) : (
+              <div className="w-16 h-24 sm:w-20 sm:h-28 rounded-lg border-2 border-dashed border-slate-700 flex items-center justify-center text-slate-600 text-xs">
+                Vide
+              </div>
+            )}
+          </div>
+
+          {roomData?.drawnCard && isMyTurn && (
+            <div className="flex flex-col items-center animate-bounce-short">
+              <span className="text-[11px] font-bold text-amber-400 mb-1 uppercase tracking-wider">
+                Piochée !
+              </span>
+              {renderCard(roomData.drawnCard, true, null, "ring-4 ring-amber-400 shadow-2xl")}
+              
+              <div className="flex gap-2 mt-2">
+                <button
+                  onClick={handleDiscardDrawn}
+                  className="bg-red-500 hover:bg-red-400 text-white text-xs font-bold px-2.5 py-1 rounded-lg shadow"
+                >
+                  Défausser
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* CARTE JOUEUR LOCAL */}
+        {myPlayer && (
+          <div className="w-full max-w-2xl bg-slate-900/90 border border-slate-800 rounded-3xl p-4 sm:p-6 shadow-2xl flex flex-col items-center relative">
+            <div className="flex justify-between items-center w-full mb-3">
+              <div className="flex items-center gap-2">
+                <span className="font-bold text-sm sm:text-base text-amber-400">Vos cartes</span>
+                {roomData?.gameState === 'GAME_OVER' && (
+                  <span className="bg-amber-400 text-slate-950 text-xs font-black px-2 py-0.5 rounded-full">
+                    Score : {myPlayer.score} pts
+                  </span>
+                )}
+              </div>
+
+              {roomData?.gameState === 'PLAYING' && roomData?.tamoulCalledBy === null && (
+                <button
+                  onClick={handleCallTamoul}
+                  className="bg-gradient-to-r from-red-600 to-amber-600 hover:from-red-500 hover:to-amber-500 text-white font-black text-xs sm:text-sm px-4 py-1.5 rounded-xl shadow-lg border border-amber-400/30 flex items-center gap-1.5 transition active:scale-95"
+                >
+                  🔔 TAMOUL !
+                </button>
+              )}
+            </div>
+
+            <div className="flex gap-2 sm:gap-4 my-2">
+              {myPlayer.cards.map((cObj, idx) => {
+                const isSelectedInPeek = peekState.selectedCards.includes(idx);
+                const isFaceUpToMe = cObj.isFaceUp || isSelectedInPeek || roomData?.gameState === 'GAME_OVER';
+
+                return (
+                  <div key={idx} className="flex flex-col items-center gap-2 relative">
+                    {renderCard(
+                      cObj.card,
+                      isFaceUpToMe,
+                      () => {
+                        if (roomData?.gameState === 'PEEKING' && !myPlayer.hasPeeked) {
+                          togglePeekCardSelection(idx);
+                          return;
+                        }
+
+                        if (isMyTurn && roomData?.drawnCard && !powerState.type) {
+                          handleSwapDrawnWithHand(idx);
+                          return;
+                        }
+
+                        if (powerState.type === 'PEEK_OWN') {
+                          resolvePeekPower(idx);
+                          return;
+                        }
+
+                        if (powerState.type === 'SWAP' && powerState.step === 2) {
+                          resolveSwapPower(idx, powerState.targetPlayerId, powerState.targetCardIndex);
+                          return;
+                        }
+                      },
+                      isSelectedInPeek ? "ring-4 ring-amber-400 scale-105" : ""
+                    )}
+
+                    {roomData?.gameState === 'PLAYING' && !roomData?.drawnCard && (
+                      <button
+                        onClick={() => handleReflexCut(idx)}
+                        className="bg-slate-800 hover:bg-emerald-600 text-[10px] text-slate-300 hover:text-white font-bold px-2 py-1 rounded-md border border-slate-700 transition"
+                      >
+                        ⚡ Couper
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+
+            {roomData?.gameState === 'PEEKING' && !myPlayer.hasPeeked && (
+              <div className="mt-4 flex flex-col items-center gap-2">
+                <span className="text-xs text-slate-300">
+                  Cartes choisies : {peekState.selectedCards.length}/2
+                </span>
+                <button
+                  disabled={peekState.selectedCards.length !== 2}
+                  onClick={handleFinishPeeking}
+                  className={`px-6 py-2 rounded-xl text-xs font-bold transition ${
+                    peekState.selectedCards.length === 2
+                      ? 'bg-amber-400 text-slate-950 hover:bg-amber-300 shadow-lg'
+                      : 'bg-slate-800 text-slate-500 cursor-not-allowed'
+                  }`}
+                >
+                  Valider et Mémoriser
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* FIN DE PARTIE */}
+      {roomData?.gameState === 'GAME_OVER' && (
+        <div className="fixed inset-0 bg-black/80 backdrop-blur-md z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-700 rounded-3xl p-6 sm:p-8 max-w-md w-full text-center shadow-2xl">
+            <Trophy className="w-16 h-16 text-amber-400 mx-auto mb-2 animate-bounce" />
+            <h2 className="text-2xl font-black text-white mb-1">Fin de Partie !</h2>
+            <p className="text-sm text-amber-400 font-bold mb-6">
+              Vainqueur : {roomData.players[roomData.winnerId]?.name} 🏆
+            </p>
+
+            <div className="space-y-2 mb-6 text-left">
+              <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400 mb-2">Classement :</h3>
+              {Object.values(roomData.players)
+                .sort((a, b) => a.score - b.score)
+                .map((p, rank) => (
+                  <div key={p.id} className="flex justify-between items-center bg-slate-800/80 p-3 rounded-xl border border-slate-700">
+                    <span className="font-semibold text-sm text-slate-200">
+                      {rank + 1}. {p.name} {p.id === roomData.winnerId && '👑'}
+                    </span>
+                    <span className="font-bold text-sm text-amber-400 font-mono">
+                      {p.score} pts
+                    </span>
+                  </div>
+                ))}
+            </div>
+
+            {roomData.hostId === user?.uid && (
+              <button
+                onClick={handleStartGame}
+                className="w-full bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold py-3 rounded-xl transition flex items-center justify-center gap-2 shadow-lg"
+              >
+                <RefreshCw className="w-4 h-4" /> Rejouer
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
