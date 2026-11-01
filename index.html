@@ -1,13 +1,274 @@
 <!DOCTYPE html>
 <html lang="fr">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Jeu Tamoul Multijoueur</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-  </head>
-  <body class="bg-slate-950 text-white">
-    <div id="root"></div>
-    <script type="module" src="/main.jsx"></script>
-  </body>
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Jeu Tamoul Multijoueur</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore-compat.js"></script>
+</head>
+<body class="bg-slate-950 text-white">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect } = React;
+
+    const firebaseConfig = {
+      apiKey: "demo-api-key",
+      authDomain: "demo-app.firebaseapp.com",
+      projectId: "demo-app",
+      storageBucket: "demo-app.appspot.com",
+      messagingSenderId: "123456789",
+      appId: "1:123456789:web:123456789"
+    };
+
+    if (!firebase.apps.length) {
+      firebase.initializeApp(firebaseConfig);
+    }
+    const auth = firebase.auth();
+    const db = firebase.firestore();
+    const appId = 'tamoul-game-v2';
+    const channel = typeof window !== 'undefined' && window.BroadcastChannel ? new BroadcastChannel('tamoul_sync_channel') : null;
+
+    const SUITS = ['♠', '♣', '♥', '♦'];
+    const VALUES = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'];
+
+    const createDeck = () => {
+      const deck = [];
+      let id = 1;
+      SUITS.forEach(suit => {
+        const isRed = suit === '♥' || suit === '♦';
+        VALUES.forEach((val, idx) => {
+          let numericValue = idx + 1;
+          let isPower = false;
+          let powerType = null;
+          if (val === 'J' || val === 'Q' || val === 'K') {
+            if (isRed) {
+              if (val === 'K') numericValue = 0;
+              else if (val === 'Q') { numericValue = 10; isPower = true; powerType = 'PEEK_OWN'; }
+              else if (val === 'J') { numericValue = 10; isPower = true; powerType = 'SWAP'; }
+            } else {
+              numericValue = 10;
+            }
+          }
+          deck.push({ id: `card_${id++}`, suit, val, isRed, numericValue, isPower, powerType });
+        });
+      });
+      deck.push({ id: `card_${id++}`, suit: '🃏', val: 'Joker', isRed: true, numericValue: 0, isPower: false });
+      deck.push({ id: `card_${id++}`, suit: '🃏', val: 'Joker', isRed: false, numericValue: 0, isPower: false });
+      for (let i = deck.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [deck[i], deck[j]] = [deck[j], deck[i]];
+      }
+      return deck;
+    };
+
+    function App() {
+      const [user, setUser] = useState(null);
+      const [playerName, setPlayerName] = useState('');
+      const [roomId, setRoomId] = useState('');
+      const [inRoom, setInRoom] = useState(false);
+      const [roomData, setRoomData] = useState(null);
+      const [showRules, setShowRules] = useState(false);
+      const [errorMessage, setErrorMessage] = useState('');
+      const [copiedCode, setCopiedCode] = useState(false);
+      const [peekState, setPeekState] = useState({ selectedCards: [] });
+
+      useEffect(() => {
+        auth.signInAnonymously().catch(() => {});
+        const unsubscribe = auth.onAuthStateChanged(usr => {
+          if (usr) setUser(usr);
+          else setUser({ uid: 'user_' + Math.random().toString(36).substring(2, 9) });
+        });
+        return () => unsubscribe();
+      }, []);
+
+      useEffect(() => {
+        if (!user || !roomId || !inRoom) return;
+        const roomRef = db.collection('artifacts').doc(appId).collection('public').doc('rooms').collection('list').doc(roomId);
+        const unsubscribe = roomRef.onSnapshot(snap => {
+          if (snap.exists) setRoomData(snap.data());
+        });
+        const handleMsg = (e) => {
+          if (e.data && e.data.roomId === roomId && e.data.roomData) setRoomData(e.data.roomData);
+        };
+        if (channel) channel.addEventListener('message', handleMsg);
+        return () => {
+          unsubscribe();
+          if (channel) channel.removeEventListener('message', handleMsg);
+        };
+      }, [user, roomId, inRoom]);
+
+      const updateRoomState = async (newState) => {
+        setRoomData(newState);
+        if (channel) channel.postMessage({ roomId: newState.roomId, roomData: newState });
+        try {
+          await db.collection('artifacts').doc(appId).collection('public').doc('rooms').collection('list').doc(newState.roomId).set(newState);
+        } catch(e) {}
+      };
+
+      const handleCreateRoom = async () => {
+        if (!playerName.trim()) return setErrorMessage('Entrez un pseudo.');
+        const uId = user?.uid || 'user_' + Math.random().toString(36).substring(2, 9);
+        const code = Math.random().toString(36).substring(2, 8).toUpperCase();
+        const initial = {
+          roomId: code,
+          hostId: uId,
+          gameState: 'LOBBY',
+          players: { [uId]: { id: uId, name: playerName.trim(), cards: [], hasPeeked: false, score: 0 } },
+          playerOrder: [uId],
+          currentTurnIndex: 0,
+          deck: [],
+          discardPile: [],
+          drawnCard: null,
+          tamoulCalledBy: null
+        };
+        await updateRoomState(initial);
+        setRoomId(code);
+        setInRoom(true);
+      };
+
+      const handleJoinRoom = async () => {
+        if (!playerName.trim() || !roomId.trim()) return setErrorMessage('Remplissez tous les champs.');
+        const code = roomId.trim().toUpperCase();
+        const uId = user?.uid || 'user_' + Math.random().toString(36).substring(2, 9);
+        let curr = roomData && roomData.roomId === code ? roomData : null;
+        if (!curr) {
+          try {
+            const snap = await db.collection('artifacts').doc(appId).collection('public').doc('rooms').collection('list').doc(code).get();
+            if (snap.exists) curr = snap.data();
+          } catch(e) {}
+        }
+        if (!curr) {
+          curr = { roomId: code, hostId: uId, gameState: 'LOBBY', players: {}, playerOrder: [], currentTurnIndex: 0, deck: [], discardPile: [] };
+        }
+        const updatedPlayers = { ...curr.players, [uId]: { id: uId, name: playerName.trim(), cards: [], hasPeeked: false, score: 0 } };
+        const updatedOrder = curr.playerOrder.includes(uId) ? curr.playerOrder : [...curr.playerOrder, uId];
+        const updatedState = { ...curr, players: updatedPlayers, playerOrder: updatedOrder };
+        await updateRoomState(updatedState);
+        setRoomId(code);
+        setInRoom(true);
+      };
+
+      const handleStartGame = async () => {
+        const deck = createDeck();
+        const players = { ...roomData.players };
+        roomData.playerOrder.forEach(id => {
+          players[id].cards = deck.splice(0, 4).map(c => ({ card: c, isFaceUp: false }));
+        });
+        const initialDiscard = [deck.pop()];
+        await updateRoomState({ ...roomData, gameState: 'PEEKING', deck, discardPile: initialDiscard, players, currentTurnIndex: 0 });
+      };
+
+      const renderCard = (card, isFaceUp, onClick) => {
+        if (!isFaceUp) {
+          return (
+            <div onClick={onClick} className="w-16 h-24 sm:w-20 sm:h-28 rounded-lg bg-gradient-to-br from-indigo-800 to-purple-900 border-2 border-indigo-400/50 flex items-center justify-center cursor-pointer shadow-md">
+              <span className="text-xl">🎴</span>
+            </div>
+          );
+        }
+        const isRed = card.isRed;
+        return (
+          <div onClick={onClick} className={`w-16 h-24 sm:w-20 sm:h-28 rounded-lg bg-white border-2 border-slate-300 p-2 flex flex-col justify-between cursor-pointer font-bold ${isRed ? 'text-red-600' : 'text-slate-900'} shadow-md`}>
+            <div className="text-sm">{card.val}{card.suit}</div>
+            <div className="text-center text-2xl">{card.suit}</div>
+            <div className="text-sm text-right rotate-180">{card.val}{card.suit}</div>
+          </div>
+        );
+      };
+
+      if (!inRoom) {
+        return (
+          <div className="min-h-screen flex items-center justify-center p-4">
+            <div className="bg-slate-900 p-6 rounded-2xl max-w-sm w-full border border-slate-800 text-center shadow-xl">
+              <h1 className="text-3xl font-black text-amber-400 mb-2">🎴 TAMOUL</h1>
+              <p className="text-xs text-slate-400 mb-6">Jeu de cartes en ligne</p>
+              {errorMessage && <p className="text-xs text-red-400 mb-3">{errorMessage}</p>}
+              <input
+                type="text" placeholder="Votre Pseudo" value={playerName} onChange={e=>setPlayerName(e.target.value)}
+                className="w-full bg-slate-800 border border-slate-700 p-3 rounded-xl mb-4 text-white text-center font-bold"
+              />
+              <button onClick={handleCreateRoom} className="w-full bg-emerald-500 text-slate-950 font-bold p-3 rounded-xl mb-3 shadow">
+                Créer un salon
+              </button>
+              <div className="flex gap-2">
+                <input type="text" placeholder="CODE" value={roomId} onChange={e=>setRoomId(e.target.value.toUpperCase())} className="w-full bg-slate-800 border border-slate-700 p-3 rounded-xl text-center uppercase font-mono" />
+                <button onClick={handleJoinRoom} className="bg-amber-400 text-slate-950 font-bold px-4 rounded-xl">Rejoindre</button>
+              </div>
+            </div>
+          </div>
+        );
+      }
+
+      const myPlayer = roomData?.players[user?.uid];
+      const isHost = roomData?.hostId === user?.uid;
+
+      return (
+        <div className="min-h-screen p-4 flex flex-col items-center justify-between">
+          <header className="w-full max-w-xl flex justify-between items-center bg-slate-900 p-4 rounded-xl border border-slate-800">
+            <span className="font-bold text-amber-400">Salon: {roomId}</span>
+            <span className="text-xs text-slate-400">{Object.keys(roomData?.players || {}).length} joueur(s)</span>
+          </header>
+
+          {roomData?.gameState === 'LOBBY' ? (
+            <div className="bg-slate-900 p-6 rounded-2xl max-w-md w-full text-center border border-slate-800 my-auto">
+              <h2 className="text-xl font-bold mb-4">Code du salon : <span className="text-amber-400 font-mono">{roomId}</span></h2>
+              <div className="space-y-2 mb-6">
+                {Object.values(roomData.players).map(p => (
+                  <div key={p.id} className="bg-slate-800 p-2 rounded-lg text-sm font-semibold">{p.name}</div>
+                ))}
+              </div>
+              {isHost ? (
+                <button onClick={handleStartGame} className="w-full bg-emerald-500 text-slate-950 font-bold p-3 rounded-xl shadow">
+                  Lancer la partie
+                </button>
+              ) : (
+                <p className="text-xs text-slate-400">En attente de l'hôte...</p>
+              )}
+            </div>
+          ) : (
+            <div className="w-full max-w-xl flex flex-col items-center gap-6 my-auto">
+              <div className="flex gap-4">
+                <div className="text-center">
+                  <p className="text-xs text-slate-400 mb-1">Pioche</p>
+                  {renderCard({ id: 'back' }, false, null)}
+                </div>
+                <div className="text-center">
+                  <p className="text-xs text-slate-400 mb-1">Défausse</p>
+                  {roomData?.discardPile?.length > 0 && renderCard(roomData.discardPile[roomData.discardPile.length - 1], true, null)}
+                </div>
+              </div>
+
+              <div className="bg-slate-900 p-4 rounded-2xl border border-slate-800 w-full text-center">
+                <p className="text-sm font-bold text-amber-400 mb-3">Vos cartes ({myPlayer?.name})</p>
+                <div className="flex justify-center gap-2">
+                  {myPlayer?.cards.map((cObj, idx) => (
+                    <div key={idx}>
+                      {renderCard(cObj.card, cObj.isFaceUp, () => {
+                        const newCards = [...myPlayer.cards];
+                        newCards[idx].isFaceUp = !newCards[idx].isFaceUp;
+                        updateRoomState({
+                          ...roomData,
+                          players: { ...roomData.players, [user.uid]: { ...myPlayer, cards: newCards } }
+                        });
+                      })}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    ReactDOM.render(<App />, document.getElementById('root'));
+  </script>
+</body>
 </html>
