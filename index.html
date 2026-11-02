@@ -160,7 +160,7 @@ export default function App() {
       setErrorMessage('Veuillez entrer un pseudo.');
       return;
     }
-    const PeerClass = typeof window !== 'undefined' ? window.Peer : null;
+    const PeerClass = typeof window !== 'undefined' && window.Peer ? window.Peer : null;
     if (!PeerClass) {
       setErrorMessage('Réseau P2P en chargement, réessayez dans un instant.');
       return;
@@ -227,7 +227,7 @@ export default function App() {
       setErrorMessage('Veuillez renseigner votre pseudo et le code du salon.');
       return;
     }
-    const PeerClass = typeof window !== 'undefined' ? window.Peer : null;
+    const PeerClass = typeof window !== 'undefined' && window.Peer ? window.Peer : null;
     if (!PeerClass) {
       setErrorMessage('Réseau P2P en chargement, réessayez dans un instant.');
       return;
