@@ -8,151 +8,6 @@
   <!-- Tailwind CSS -->
   <script src="https://cdn.tailwindcss.com"></script>
 
-  <!-- Firebase SDKs -->
-  <script type="module">
-    import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js';
-    import { getAuth, signInAnonymously } from 'https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js';
-    import { getFirestore, doc, setDoc, getDoc, onSnapshot } from 'https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js';
-
-    let db, auth, currentUser, currentRoomId = null, unsubscribeRoom = null;
-    const appId = typeof __app_id !== 'undefined' ? __app_id : 'tamoul-default-app';
-
-    window.addEventListener('DOMContentLoaded', async () => {
-      try {
-        let firebaseConfig = {};
-        if (typeof __firebase_config !== 'undefined' && __firebase_config) {
-          firebaseConfig = typeof __firebase_config === 'string' ? JSON.parse(__firebase_config) : __firebase_config;
-        } else {
-          firebaseConfig = {
-            apiKey: "AIzaSyDummyKeyForSandbox123456",
-            authDomain: "tamoul-app.firebaseapp.com",
-            projectId: "tamoul-app",
-            storageBucket: "tamoul-app.appspot.com",
-            messagingSenderId: "123456789",
-            appId: "1:123456789:web:abcdef"
-          };
-        }
-
-        const app = initializeApp(firebaseConfig);
-        auth = getAuth(app);
-        db = getFirestore(app);
-
-        await signInAnonymously(auth);
-        currentUser = auth.currentUser;
-      } catch (e) {
-        console.error("Firebase init error:", e);
-      }
-    });
-
-    window.cloudCreateRoom = async function(playerName) {
-      const myId = (currentUser && currentUser.uid) ? currentUser.uid : 'usr_' + Math.random().toString(36).substring(2, 7);
-      const code = Math.random().toString(36).substring(2, 8).toUpperCase();
-
-      const initialData = {
-        roomId: code,
-        hostId: myId,
-        phase: 'LOBBY',
-        players: {
-          [myId]: { id: myId, name: playerName, cards: [], hasPeeked: false, score: 0 }
-        },
-        playerOrder: [myId],
-        turnIndex: 0,
-        deck: [],
-        discardPile: [],
-        drawnCard: null,
-        lastAction: `${playerName} a créé le salon.`
-      };
-
-      try {
-        if (db) {
-          await setDoc(doc(db, 'artifacts', appId, 'public', 'data', `room_${code}`), initialData);
-          startListeningRoom(code);
-        }
-        currentRoomId = code;
-        onRoomCreatedSuccess(code, myId, initialData);
-      } catch (e) {
-        currentRoomId = code;
-        onRoomCreatedSuccess(code, myId, initialData);
-      }
-    };
-
-    window.cloudJoinRoom = async function(code, playerName) {
-      const myId = (currentUser && currentUser.uid) ? currentUser.uid : 'usr_' + Math.random().toString(36).substring(2, 7);
-      
-      let snap = null;
-      let roomRef = null;
-      
-      // Essayer de récupérer le salon avec des nouvelles tentatives pour contrer la latence réseau
-      for (let attempt = 0; attempt < 10; attempt++) {
-        try {
-          if (!db) break;
-          roomRef = doc(db, 'artifacts', appId, 'public', 'data', `room_${code}`);
-          snap = await getDoc(roomRef);
-          if (snap.exists()) break;
-        } catch (e) {}
-        await new Promise(r => setTimeout(r, 500));
-      }
-
-      if (!snap || !snap.exists()) {
-        showErrorMessage("Salon introuvable. Vérifiez que le code est exact et que l'hôte a bien créé le salon !");
-        return;
-      }
-
-      try {
-        const data = snap.data();
-        const players = data.players || {};
-        
-        if (!players[myId]) {
-          players[myId] = { id: myId, name: playerName, cards: [], hasPeeked: false, score: 0 };
-        }
-        const playerOrder = data.playerOrder.includes(myId) ? data.playerOrder : [...data.playerOrder, myId];
-
-        const updatedData = {
-          ...data,
-          players,
-          playerOrder,
-          lastAction: `${playerName} a rejoint le salon.`
-        };
-
-        if (db) {
-          await setDoc(roomRef, updatedData);
-        }
-
-        currentRoomId = code;
-        startListeningRoom(code);
-        onRoomJoinedSuccess(code, myId, updatedData);
-      } catch (e) {
-        currentRoomId = code;
-        startListeningRoom(code);
-        onRoomJoinedSuccess(code, myId, snap.data());
-      }
-    };
-
-    window.cloudUpdateState = async function(newState) {
-      if (!db || !currentRoomId) return;
-      try {
-        const roomRef = doc(db, 'artifacts', appId, 'public', 'data', `room_${currentRoomId}`);
-        await setDoc(roomRef, newState);
-      } catch (e) {
-        console.error("Update state error:", e);
-      }
-    };
-
-    function startListeningRoom(code) {
-      if (unsubscribeRoom) unsubscribeRoom();
-      if (!db) return;
-      const roomRef = doc(db, 'artifacts', appId, 'public', 'data', `room_${code}`);
-      unsubscribeRoom = onSnapshot(roomRef, (docSnap) => {
-        if (docSnap.exists()) {
-          const updated = docSnap.data();
-          syncRemoteState(updated);
-        }
-      }, (err) => {
-        console.error("Sync error:", err);
-      });
-    }
-  </script>
-
   <style>
     .bg-apocalyptic {
       background: radial-gradient(circle at 50% 90%, #ea580c 0%, #991b1b 25%, #3f1212 55%, #090d16 85%, #020617 100%);
@@ -375,6 +230,7 @@
   <script>
     let myName = '';
     let roomCode = '';
+    let myUserId = 'usr_' + Math.random().toString(36).substring(2, 7);
     let gameState = {
       phase: 'LOBBY',
       players: {},
@@ -386,6 +242,7 @@
     };
 
     let selectedPeek = [];
+    let syncInterval = null;
 
     window.addEventListener('DOMContentLoaded', () => {
       const params = new URLSearchParams(window.location.search);
@@ -463,7 +320,28 @@
         showErrorMessage('Veuillez entrer un pseudo.');
         return;
       }
-      window.cloudCreateRoom(myName);
+      roomCode = Math.random().toString(36).substring(2, 8).toUpperCase();
+      
+      gameState = {
+        phase: 'LOBBY',
+        players: {
+          [myUserId]: { id: myUserId, name: myName, cards: [], hasPeeked: false, score: 0 }
+        },
+        playerOrder: [myUserId],
+        turnIndex: 0,
+        deck: [],
+        discardPile: [],
+        drawnCard: null
+      };
+
+      saveState();
+      startPolling();
+
+      document.getElementById('screenHome').style.display = 'none';
+      document.getElementById('screenLobby').style.display = 'flex';
+      document.getElementById('displayRoomCode').textContent = roomCode;
+      document.getElementById('headerRoomCode').textContent = `(${roomCode})`;
+      renderLobby();
     }
 
     function handleJoinRoomClick() {
@@ -473,47 +351,71 @@
         showErrorMessage('Remplissez tous les champs.');
         return;
       }
-      window.cloudJoinRoom(code, myName);
+
+      const saved = localStorage.getItem(`tamoul_room_${code}`);
+      if (!saved) {
+        showErrorMessage('Salon introuvable. Vérifiez que l\'hôte a bien créé le salon !');
+        return;
+      }
+
+      roomCode = code;
+      try {
+        gameState = JSON.parse(saved);
+      } catch(e) {}
+
+      if (!gameState.players[myUserId]) {
+        gameState.players[myUserId] = { id: myUserId, name: myName, cards: [], hasPeeked: false, score: 0 };
+        if (!gameState.playerOrder.includes(myUserId)) {
+          gameState.playerOrder.push(myUserId);
+        }
+      }
+
+      saveState();
+      startPolling();
+
+      document.getElementById('screenHome').style.display = 'none';
+      if (gameState.phase === 'LOBBY') {
+        document.getElementById('screenLobby').style.display = 'flex';
+        renderLobby();
+      } else {
+        document.getElementById('screenLobby').style.display = 'none';
+        document.getElementById('screenGame').style.display = 'flex';
+        renderGame();
+      }
+      document.getElementById('displayRoomCode').textContent = roomCode;
+      document.getElementById('headerRoomCode').textContent = `(${roomCode})`;
     }
 
-    window.onRoomCreatedSuccess = function(code, myId, initialState) {
-      roomCode = code;
-      gameState = initialState;
-      document.getElementById('screenHome').style.display = 'none';
-      document.getElementById('screenLobby').style.display = 'flex';
-      document.getElementById('displayRoomCode').textContent = code;
-      document.getElementById('headerRoomCode').textContent = `(${code})`;
-      renderLobby();
-    };
+    function saveState() {
+      if (!roomCode) return;
+      localStorage.setItem(`tamoul_room_${roomCode}`, JSON.stringify(gameState));
+    }
 
-    window.onRoomJoinedSuccess = function(code, myId, updatedState) {
-      roomCode = code;
-      gameState = updatedState;
-      document.getElementById('screenHome').style.display = 'none';
-      if (gameState.phase === 'LOBBY') {
-        document.getElementById('screenLobby').style.display = 'flex';
-        renderLobby();
-      } else {
-        document.getElementById('screenLobby').style.display = 'none';
-        document.getElementById('screenGame').style.display = 'flex';
-        renderGame();
-      }
-      document.getElementById('displayRoomCode').textContent = code;
-      document.getElementById('headerRoomCode').textContent = `(${code})`;
-    };
-
-    window.syncRemoteState = function(remoteState) {
-      gameState = remoteState;
-      if (gameState.phase === 'LOBBY') {
-        document.getElementById('screenLobby').style.display = 'flex';
-        document.getElementById('screenGame').style.display = 'none';
-        renderLobby();
-      } else {
-        document.getElementById('screenLobby').style.display = 'none';
-        document.getElementById('screenGame').style.display = 'flex';
-        renderGame();
-      }
-    };
+    function startPolling() {
+      if (syncInterval) clearInterval(syncInterval);
+      syncInterval = setInterval(() => {
+        if (!roomCode) return;
+        const saved = localStorage.getItem(`tamoul_room_${roomCode}`);
+        if (saved) {
+          try {
+            const remoteState = JSON.parse(saved);
+            // Vérifier si mise à jour nécessaire
+            if (JSON.stringify(remoteState) !== JSON.stringify(gameState)) {
+              gameState = remoteState;
+              if (gameState.phase === 'LOBBY') {
+                document.getElementById('screenLobby').style.display = 'flex';
+                document.getElementById('screenGame').style.display = 'none';
+                renderLobby();
+              } else {
+                document.getElementById('screenLobby').style.display = 'none';
+                document.getElementById('screenGame').style.display = 'flex';
+                renderGame();
+              }
+            }
+          } catch(e) {}
+        }
+      }, 1000);
+    }
 
     function renderLobby() {
       const list = document.getElementById('playersList');
@@ -536,7 +438,7 @@
       gameState.discardPile = [deck.pop()];
       gameState.phase = 'PEEKING';
       gameState.turnIndex = 0;
-      window.cloudUpdateState(gameState);
+      saveState();
     }
 
     function renderCard(card, faceUp, onClickAttr = '') {
@@ -555,12 +457,11 @@
     }
 
     function renderGame() {
-      const myId = Object.keys(gameState.players).find(id => gameState.players[id].name === myName) || Object.keys(gameState.players)[0];
       const oppArea = document.getElementById('opponentsArea');
       oppArea.innerHTML = '';
       
       gameState.playerOrder.forEach(pId => {
-        if (pId === myId) return;
+        if (pId === myUserId) return;
         const p = gameState.players[pId];
         if (!p) return;
         const isTurn = gameState.playerOrder[gameState.turnIndex] === pId;
@@ -582,14 +483,14 @@
       document.getElementById('discardCardContainer').innerHTML = renderCard(topDiscard, true);
 
       const drawnContainer = document.getElementById('drawnCardContainer');
-      if (gameState.drawnCard && gameState.playerOrder[gameState.turnIndex] === myId) {
+      if (gameState.drawnCard && gameState.playerOrder[gameState.turnIndex] === myUserId) {
         drawnContainer.style.display = 'flex';
         document.getElementById('drawnCardView').innerHTML = renderCard(gameState.drawnCard, true);
       } else {
         drawnContainer.style.display = 'none';
       }
 
-      const myPlayer = gameState.players[myId];
+      const myPlayer = gameState.players[myUserId];
       const myHandGrid = document.getElementById('myHandGrid');
       myHandGrid.innerHTML = '';
       if (myPlayer && myPlayer.cards) {
@@ -598,9 +499,9 @@
           let clickHandler = '';
           if (gameState.phase === 'PEEKING' && !myPlayer.hasPeeked) {
             clickHandler = `onclick="togglePeek(${idx})"`;
-          } else if (gameState.phase === 'PLAYING' && gameState.playerOrder[gameState.turnIndex] === myId && gameState.drawnCard) {
+          } else if (gameState.phase === 'PLAYING' && gameState.playerOrder[gameState.turnIndex] === myUserId && gameState.drawnCard) {
             clickHandler = `onclick="swapCard(${idx})"`;
-          } else if (gameState.phase === 'PLAYING' && gameState.playerOrder[gameState.turnIndex] === myId && !gameState.drawnCard) {
+          } else if (gameState.phase === 'PLAYING' && gameState.playerOrder[gameState.turnIndex] === myUserId && !gameState.drawnCard) {
             clickHandler = `onclick="reflexCut(${idx})"`;
           }
           const wrapper = document.createElement('div');
@@ -636,21 +537,20 @@
     }
 
     function finishPeeking() {
-      const myId = Object.keys(gameState.players).find(id => gameState.players[id].name === myName) || Object.keys(gameState.players)[0];
-      gameState.players[myId].hasPeeked = true;
+      const myPlayer = gameState.players[myUserId];
+      myPlayer.hasPeeked = true;
       selectedPeek = [];
       
       const allDone = Object.values(gameState.players).every(p => p.hasPeeked);
       if (allDone) {
         gameState.phase = 'PLAYING';
       }
-      window.cloudUpdateState(gameState);
+      saveState();
     }
 
     function drawCard() {
-      const myId = Object.keys(gameState.players).find(id => gameState.players[id].name === myName) || Object.keys(gameState.players)[0];
       if (gameState.phase !== 'PLAYING') return;
-      if (gameState.playerOrder[gameState.turnIndex] !== myId) return;
+      if (gameState.playerOrder[gameState.turnIndex] !== myUserId) return;
       if (gameState.drawnCard) return;
 
       playCardSound();
@@ -660,13 +560,12 @@
         gameState.discardPile = [top];
       }
       gameState.drawnCard = gameState.deck.pop();
-      window.cloudUpdateState(gameState);
+      saveState();
     }
 
     function swapCard(idx) {
       playCardSound();
-      const myId = Object.keys(gameState.players).find(id => gameState.players[id].name === myName) || Object.keys(gameState.players)[0];
-      const myPlayer = gameState.players[myId];
+      const myPlayer = gameState.players[myUserId];
       const old = myPlayer.cards[idx];
       myPlayer.cards[idx] = { card: gameState.drawnCard, faceUp: false };
       gameState.discardPile.push(old.card);
@@ -684,9 +583,8 @@
 
     function reflexCut(idx) {
       playCardSound();
-      const myId = Object.keys(gameState.players).find(id => gameState.players[id].name === myName) || Object.keys(gameState.players)[0];
       const topDiscard = gameState.discardPile[gameState.discardPile.length - 1];
-      const myPlayer = gameState.players[myId];
+      const myPlayer = gameState.players[myUserId];
       const target = myPlayer.cards[idx];
 
       if (target.card.val === topDiscard.val) {
@@ -698,17 +596,17 @@
           myPlayer.cards.push({ card: gameState.deck.pop(), faceUp: false });
         }
       }
-      window.cloudUpdateState(gameState);
+      saveState();
     }
 
     function callTamoul() {
       gameState.phase = 'GAME_OVER';
-      window.cloudUpdateState(gameState);
+      saveState();
     }
 
     function nextTurn() {
       gameState.turnIndex = (gameState.turnIndex + 1) % gameState.playerOrder.length;
-      window.cloudUpdateState(gameState);
+      saveState();
     }
   </script>
 </body>
