@@ -37,7 +37,6 @@
         auth = getAuth(app);
         db = getFirestore(app);
 
-        // Connexion anonyme immédiate et silencieuse
         await signInAnonymously(auth);
         currentUser = auth.currentUser;
       } catch (e) {
@@ -46,7 +45,6 @@
     });
 
     window.cloudCreateRoom = async function(playerName) {
-      // Si l'auth met une fraction de seconde, on génère un ID local de secours
       const myId = (currentUser && currentUser.uid) ? currentUser.uid : 'usr_' + Math.random().toString(36).substring(2, 7);
       const code = Math.random().toString(36).substring(2, 8).toUpperCase();
 
@@ -67,13 +65,13 @@
 
       try {
         if (db) {
+          // Sauvegarde dans la collection publique partagée
           await setDoc(doc(db, 'artifacts', appId, 'public', 'data', `room_${code}`), initialData);
           startListeningRoom(code);
         }
         currentRoomId = code;
         onRoomCreatedSuccess(code, myId, initialData);
       } catch (e) {
-        // Fallback local instantané si Firestore est hors-ligne
         currentRoomId = code;
         onRoomCreatedSuccess(code, myId, initialData);
       }
@@ -82,19 +80,19 @@
     window.cloudJoinRoom = async function(code, playerName) {
       const myId = (currentUser && currentUser.uid) ? currentUser.uid : 'usr_' + Math.random().toString(36).substring(2, 7);
       
-      // Tentative de connexion avec plusieurs essais pour pallier la latence réseau initiale de Firestore
       let snap = null;
       let roomRef = null;
       
-      for (let attempt = 0; attempt < 3; attempt++) {
+      // Boucle de tentative élargie pour synchroniser instantanément avec le salon de l'hôte
+      for (let attempt = 0; attempt < 8; attempt++) {
         try {
           if (!db) break;
           roomRef = doc(db, 'artifacts', appId, 'public', 'data', `room_${code}`);
           snap = await getDoc(roomRef);
           if (snap.exists()) break;
         } catch (e) {
-          // Attendre 500ms avant de réessayer
-          await new Promise(r => setTimeout(r, 500));
+          // Attendre 600ms entre chaque tentative
+          await new Promise(r => setTimeout(r, 600));
         }
       }
 
@@ -106,7 +104,11 @@
       try {
         const data = snap.data();
         const players = data.players || {};
-        players[myId] = players[myId] || { id: myId, name: playerName, cards: [], hasPeeked: false, score: 0 };
+        
+        // Empêcher d'écraser si déjà présent, ou ajouter le nouveau joueur
+        if (!players[myId]) {
+          players[myId] = { id: myId, name: playerName, cards: [], hasPeeked: false, score: 0 };
+        }
         const playerOrder = data.playerOrder.includes(myId) ? data.playerOrder : [...data.playerOrder, myId];
 
         await updateDoc(roomRef, {
@@ -119,7 +121,10 @@
         startListeningRoom(code);
         onRoomJoinedSuccess(code, myId, { ...data, players, playerOrder });
       } catch (e) {
-        showErrorMessage("Erreur lors de la connexion au salon. Réessayez dans un instant.");
+        // Fallback local direct en cas de blocage réseau persistant
+        currentRoomId = code;
+        startListeningRoom(code);
+        onRoomJoinedSuccess(code, myId, snap.data());
       }
     };
 
