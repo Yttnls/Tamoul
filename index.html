@@ -259,43 +259,45 @@
     let connections = {};
     let hostConn = null;
 
-    // Relais de communication multi-onglets + PeerJS P2P Universel
-    const broadcastChannel = new BroadcastChannel('tamoul_global_network');
-
-    broadcastChannel.onmessage = (event) => {
-      const data = event.data;
-      if (data && data.roomCode === roomCode) {
-        if (data.type === 'SYNC_STATE') {
-          gameState = data.state;
-          updateUI();
-        } else if (data.type === 'JOIN_REQUEST' && isHost) {
-          gameState.players[data.player.id] = data.player;
-          if (!gameState.playerOrder.includes(data.player.id)) {
-            gameState.playerOrder.push(data.player.id);
-          }
-          saveAndSync();
-        }
-      }
-    };
-
-    window.addEventListener('DOMContentLoaded', () => {
-      const params = new URLSearchParams(window.location.search);
-      const salonParam = params.get('salon');
-      if (salonParam) {
-        document.getElementById('inputRoomCode').value = salonParam.toUpperCase();
-      }
-      initPeer();
-    });
-
-    function initPeer() {
-      if (window.Peer) return;
+    // Chargement dynamique de PeerJS pour une connexion P2P directe sans clé d'API
+    (function loadPeerJS() {
       const script = document.createElement('script');
       script.src = 'https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js';
-      script.onload = () => console.log('Réseau P2P prêt');
       document.body.appendChild(script);
+    })();
+
+    function initPeer(id, callback) {
+      if (!window.Peer) {
+        setTimeout(() => initPeer(id, callback), 200);
+        return;
+      }
+      if (peer) peer.destroy();
+      peer = new window.Peer(id, { debug: 1 });
+      peer.on('open', callback);
+      peer.on('error', (err) => {
+        showErrorMessage('Erreur réseau ou salon introuvable.');
+      });
     }
 
-    function copyInviteLink() {
+    function setupHostServer() {
+      peer.on('connection', (conn) => {
+        connections[conn.peer] = conn;
+        conn.on('data', (data) => {
+          if (data.type === 'JOIN') {
+            gameState.players[data.player.id] = data.player;
+            if (!gameState.playerOrder.includes(data.player.id)) {
+              gameState.playerOrder.push(data.player.id);
+            }
+            saveAndSync();
+          } else if (data.type === 'ACTION') {
+            gameState = data.state;
+            saveAndSync();
+          }
+        });
+      });
+    }
+
+    function window_copyInviteLink() {
       const inviteUrl = `${window.location.origin}${window.location.pathname}?salon=${roomCode}`;
       const textArea = document.createElement("textarea");
       textArea.value = inviteUrl;
@@ -311,6 +313,7 @@
       } catch (err) {}
       document.body.removeChild(textArea);
     }
+    window.copyInviteLink = window_copyInviteLink;
 
     function showErrorMessage(msg) {
       const el = document.getElementById('errorMessage');
@@ -358,23 +361,14 @@
     }
 
     function saveAndSync() {
-      if (!roomCode) return;
-      localStorage.setItem(`tamoul_room_${roomCode}`, JSON.stringify(gameState));
-
-      // Diffusion locale
-      broadcastChannel.postMessage({ type: 'SYNC_STATE', roomCode, state: gameState });
-
-      // Diffusion P2P réseau distant
-      Object.values(connections).forEach(conn => {
-        if (conn && conn.open) {
-          conn.send({ type: 'SYNC_STATE', state: gameState });
-        }
-      });
-      if (hostConn && hostConn.open) {
-        hostConn.send({ type: 'SYNC_STATE', state: gameState });
-      }
-
       updateUI();
+      if (isHost) {
+        Object.values(connections).forEach(conn => {
+          if (conn.open) conn.send({ type: 'SYNC', state: gameState });
+        });
+      } else if (hostConn && hostConn.open) {
+        hostConn.send({ type: 'ACTION', state: gameState });
+      }
     }
 
     function handleCreateRoomClick() {
@@ -399,33 +393,13 @@
         drawnCard: null
       };
 
-      if (window.Peer) {
-        try {
-          peer = new Peer(`tamoul-room-${roomCode}`);
-          peer.on('connection', (conn) => {
-            connections[conn.peer] = conn;
-            conn.on('data', (data) => {
-              if (data.type === 'JOIN_REQUEST') {
-                gameState.players[data.player.id] = data.player;
-                if (!gameState.playerOrder.includes(data.player.id)) {
-                  gameState.playerOrder.push(data.player.id);
-                }
-                saveAndSync();
-              } else if (data.type === 'ACTION') {
-                gameState = data.state;
-                saveAndSync();
-              }
-            });
-            conn.send({ type: 'SYNC_STATE', state: gameState });
-          });
-        } catch(e) {}
-      }
-
-      saveAndSync();
-
-      document.getElementById('screenHome').style.display = 'none';
-      document.getElementById('displayRoomCode').textContent = roomCode;
-      document.getElementById('headerRoomCode').textContent = `(${roomCode})`;
+      initPeer(`tamoul_room_${roomCode}`, () => {
+        setupHostServer();
+        document.getElementById('screenHome').style.display = 'none';
+        document.getElementById('displayRoomCode').textContent = roomCode;
+        document.getElementById('headerRoomCode').textContent = `(${roomCode})`;
+        updateUI();
+      });
     }
 
     function handleJoinRoomClick() {
@@ -438,83 +412,26 @@
 
       roomCode = code;
       isHost = false;
+      const peerId = `usr_${Math.random().toString(36).substring(2, 7)}`;
 
-      const playerObj = { id: myUserId, name: myName, cards: [], hasPeeked: false, score: 0 };
+      initPeer(peerId, () => {
+        hostConn = peer.connect(`tamoul_room_${roomCode}`);
+        hostConn.on('open', () => {
+          const playerObj = { id: myUserId, name: myName, cards: [], hasPeeked: false, score: 0 };
+          hostConn.send({ type: 'JOIN', player: playerObj });
 
-      // Tentative de rejoindre via BroadcastChannel
-      broadcastChannel.postMessage({ type: 'JOIN_REQUEST', roomCode, player: playerObj });
+          document.getElementById('screenHome').style.display = 'none';
+          document.getElementById('displayRoomCode').textContent = roomCode;
+          document.getElementById('headerRoomCode').textContent = `(${roomCode})`;
+        });
 
-      // Tentative de rejoindre via PeerJS P2P
-      if (window.Peer) {
-        try {
-          peer = new Peer();
-          peer.on('open', () => {
-            hostConn = peer.connect(`tamoul-room-${roomCode}`);
-            hostConn.on('open', () => {
-              hostConn.send({ type: 'JOIN_REQUEST', player: playerObj });
-            });
-            hostConn.on('data', (data) => {
-              if (data.type === 'SYNC_STATE') {
-                gameState = data.state;
-                updateUI();
-              }
-            });
-          });
-        } catch(e) {}
-      }
-
-      const saved = localStorage.getItem(`tamoul_room_${roomCode}`);
-      if (saved) {
-        try {
-          gameState = JSON.parse(saved);
-          if (!gameState.players[myUserId]) {
-            gameState.players[myUserId] = playerObj;
-            if (!gameState.playerOrder.includes(myUserId)) {
-              gameState.playerOrder.push(myUserId);
-            }
+        hostConn.on('data', (data) => {
+          if (data.type === 'SYNC') {
+            gameState = data.state;
+            updateUI();
           }
-        } catch(e) {}
-      } else {
-        gameState.players[myUserId] = playerObj;
-        gameState.playerOrder = [myUserId];
-      }
-
-      saveAndSync();
-
-      document.getElementById('screenHome').style.display = 'none';
-      document.getElementById('displayRoomCode').textContent = roomCode;
-      document.getElementById('headerRoomCode').textContent = `(${roomCode})`;
-    }
-
-    function handleJoinRoomClick() {
-      myName = document.getElementById('inputPlayerName').value.trim();
-      const code = document.getElementById('inputRoomCode').value.trim().toUpperCase();
-      if (!myName || !code) {
-        showErrorMessage('Veuillez saisir votre pseudo et le code du salon.');
-        return;
-      }
-
-      roomCode = code;
-      isHost = false;
-
-      const saved = localStorage.getItem(`tamoul_room_${roomCode}`);
-      if (saved) {
-        try { gameState = JSON.parse(saved); } catch(e) {}
-      }
-
-      if (!gameState.players[myUserId]) {
-        gameState.players[myUserId] = { id: myUserId, name: myName, cards: [], hasPeeked: false, score: 0 };
-        if (!gameState.playerOrder.includes(myUserId)) {
-          gameState.playerOrder.push(myUserId);
-        }
-      }
-
-      saveAndSync();
-      startAutoSync();
-
-      document.getElementById('screenHome').style.display = 'none';
-      document.getElementById('displayRoomCode').textContent = roomCode;
-      document.getElementById('headerRoomCode').textContent = `(${roomCode})`;
+        });
+      });
     }
 
     function updateUI() {
