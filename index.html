@@ -139,6 +139,7 @@
             class="w-full bg-slate-950 border border-slate-700 px-4 py-3 text-white uppercase font-mono tracking-widest text-center focus:outline-none focus:border-amber-400"
           />
           <button
+            id="btnJoinRoom"
             onclick="handleJoinRoomClick()"
             class="bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold px-6 py-3 transition shadow cursor-pointer"
           >
@@ -372,7 +373,7 @@
       renderLobby();
     }
 
-    async function handleJoinRoomClick() {
+    function handleJoinRoomClick() {
       myName = document.getElementById('inputPlayerName').value.trim();
       const code = document.getElementById('inputRoomCode').value.trim().toUpperCase();
       if (!myName) {
@@ -385,41 +386,16 @@
       }
 
       roomCode = code;
-      initBroadcastChannel();
+      
+      // Passage immédiat à l'écran de salon pour un retour visuel instantané
+      document.getElementById('screenHome').style.display = 'none';
+      document.getElementById('screenLobby').style.display = 'flex';
+      document.getElementById('displayRoomCode').textContent = roomCode;
+      document.getElementById('headerRoomCode').textContent = `(${roomCode})`;
 
       let saved = localStorage.getItem(`tamoul_room_${code}`);
-
-      // Récupération de secours depuis le serveur cloud temporaire si non présent localement
-      if (!saved) {
-        try {
-          const res = await fetch(`https://ntfy.sh/tamoul_room_sync_${code}/raw`);
-          if (res.ok) {
-            const text = await res.text();
-            if (text && text.startsWith('{')) {
-              saved = text;
-            }
-          }
-        } catch(e) {}
-      }
-
-      // Si le salon n'a pas encore de sauvegarde cloud, on initialise le salon pour l'invité
-      if (!saved) {
-        gameState = {
-          phase: 'LOBBY',
-          hostId: myUserId,
-          players: {
-            [myUserId]: { id: myUserId, name: myName, cards: [], hasPeeked: false, score: 0 }
-          },
-          playerOrder: [myUserId],
-          turnIndex: 0,
-          deck: [],
-          discardPile: [],
-          drawnCard: null
-        };
-      } else {
-        try {
-          gameState = JSON.parse(saved);
-        } catch(e) {}
+      if (saved) {
+        try { gameState = JSON.parse(saved); } catch(e) {}
       }
 
       if (!gameState.players[myUserId]) {
@@ -429,13 +405,10 @@
         }
       }
 
+      initBroadcastChannel();
       saveState();
-      startPolling();
-
-      document.getElementById('screenHome').style.display = 'none';
       updateUI();
-      document.getElementById('displayRoomCode').textContent = roomCode;
-      document.getElementById('headerRoomCode').textContent = `(${roomCode})`;
+      startPolling();
     }
 
     function saveState() {
