@@ -81,19 +81,29 @@
 
     window.cloudJoinRoom = async function(code, playerName) {
       const myId = (currentUser && currentUser.uid) ? currentUser.uid : 'usr_' + Math.random().toString(36).substring(2, 7);
+      
+      // Tentative de connexion avec plusieurs essais pour pallier la latence réseau initiale de Firestore
+      let snap = null;
+      let roomRef = null;
+      
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          if (!db) break;
+          roomRef = doc(db, 'artifacts', appId, 'public', 'data', `room_${code}`);
+          snap = await getDoc(roomRef);
+          if (snap.exists()) break;
+        } catch (e) {
+          // Attendre 500ms avant de réessayer
+          await new Promise(r => setTimeout(r, 500));
+        }
+      }
+
+      if (!snap || !snap.exists()) {
+        showErrorMessage("Salon introuvable. Vérifiez que le code est exact et que l'hôte a bien créé le salon !");
+        return;
+      }
+
       try {
-        if (!db) {
-          showErrorMessage("Erreur de connexion réseau.");
-          return;
-        }
-        const roomRef = doc(db, 'artifacts', appId, 'public', 'data', `room_${code}`);
-        const snap = await getDoc(roomRef);
-
-        if (!snap.exists()) {
-          showErrorMessage("Salon introuvable. Vérifiez le code !");
-          return;
-        }
-
         const data = snap.data();
         const players = data.players || {};
         players[myId] = players[myId] || { id: myId, name: playerName, cards: [], hasPeeked: false, score: 0 };
@@ -109,7 +119,7 @@
         startListeningRoom(code);
         onRoomJoinedSuccess(code, myId, { ...data, players, playerOrder });
       } catch (e) {
-        showErrorMessage("Erreur lors de la connexion au salon.");
+        showErrorMessage("Erreur lors de la connexion au salon. Réessayez dans un instant.");
       }
     };
 
