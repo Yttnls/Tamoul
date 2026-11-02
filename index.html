@@ -247,6 +247,7 @@
     let selectedPeek = [];
     let syncInterval = null;
     let isFetching = false;
+    let broadcastChannel = null;
 
     window.addEventListener('DOMContentLoaded', () => {
       const params = new URLSearchParams(window.location.search);
@@ -255,6 +256,26 @@
         document.getElementById('inputRoomCode').value = salonParam.toUpperCase();
       }
     });
+
+    function initBroadcastChannel() {
+      if (!roomCode) return;
+      if (broadcastChannel) {
+        try { broadcastChannel.close(); } catch(e){}
+      }
+      try {
+        broadcastChannel = new BroadcastChannel(`tamoul_channel_${roomCode}`);
+        broadcastChannel.onmessage = (event) => {
+          if (event.data && event.data.type === 'SYNC_STATE') {
+            const remoteState = event.data.state;
+            if (remoteState && JSON.stringify(remoteState) !== JSON.stringify(gameState)) {
+              gameState = remoteState;
+              localStorage.setItem(`tamoul_room_${roomCode}`, JSON.stringify(gameState));
+              updateUI();
+            }
+          }
+        };
+      } catch(e) {}
+    }
 
     function copyInviteLink() {
       const inviteUrl = `${window.location.origin}${window.location.pathname}?salon=${roomCode}`;
@@ -339,6 +360,7 @@
         drawnCard: null
       };
 
+      initBroadcastChannel();
       saveState();
       startPolling();
 
@@ -358,25 +380,42 @@
       }
 
       roomCode = code;
+      initBroadcastChannel();
+
       let saved = localStorage.getItem(`tamoul_room_${code}`);
 
+      // Récupération de secours depuis le serveur cloud temporaire si non présent localement
       if (!saved) {
         try {
-          const res = await fetch(`https://api.keyvalue.xyz/${code}/tamoulState`);
+          const res = await fetch(`https://ntfy.sh/tamoul_room_sync_${code}/raw`);
           if (res.ok) {
-            saved = await res.text();
+            const text = await res.text();
+            if (text && text.startsWith('{')) {
+              saved = text;
+            }
           }
         } catch(e) {}
       }
 
+      // Si le salon n'a pas encore de sauvegarde cloud, on initialise le salon pour l'invité
       if (!saved) {
-        showErrorMessage('Salon introuvable. Vérifiez le code ou réessayez.');
-        return;
+        gameState = {
+          phase: 'LOBBY',
+          hostId: myUserId,
+          players: {
+            [myUserId]: { id: myUserId, name: myName, cards: [], hasPeeked: false, score: 0 }
+          },
+          playerOrder: [myUserId],
+          turnIndex: 0,
+          deck: [],
+          discardPile: [],
+          drawnCard: null
+        };
+      } else {
+        try {
+          gameState = JSON.parse(saved);
+        } catch(e) {}
       }
-
-      try {
-        gameState = JSON.parse(saved);
-      } catch(e) {}
 
       if (!gameState.players[myUserId]) {
         gameState.players[myUserId] = { id: myUserId, name: myName, cards: [], hasPeeked: false, score: 0 };
@@ -389,14 +428,7 @@
       startPolling();
 
       document.getElementById('screenHome').style.display = 'none';
-      if (gameState.phase === 'LOBBY') {
-        document.getElementById('screenLobby').style.display = 'flex';
-        renderLobby();
-      } else {
-        document.getElementById('screenLobby').style.display = 'none';
-        document.getElementById('screenGame').style.display = 'flex';
-        renderGame();
-      }
+      updateUI();
       document.getElementById('displayRoomCode').textContent = roomCode;
       document.getElementById('headerRoomCode').textContent = `(${roomCode})`;
     }
@@ -406,10 +438,29 @@
       const json = JSON.stringify(gameState);
       localStorage.setItem(`tamoul_room_${roomCode}`, json);
 
-      fetch(`https://api.keyvalue.xyz/${roomCode}/tamoulState`, {
+      if (broadcastChannel) {
+        try {
+          broadcastChannel.postMessage({ type: 'SYNC_STATE', state: gameState });
+        } catch(e) {}
+      }
+
+      // Envoi de secours vers le relais ntfy (compatible CORS universel)
+      fetch(`https://ntfy.sh/tamoul_room_sync_${roomCode}`, {
         method: 'POST',
         body: json
       }).catch(() => {});
+    }
+
+    function updateUI() {
+      if (gameState.phase === 'LOBBY') {
+        document.getElementById('screenLobby').style.display = 'flex';
+        document.getElementById('screenGame').style.display = 'none';
+        renderLobby();
+      } else {
+        document.getElementById('screenLobby').style.display = 'none';
+        document.getElementById('screenGame').style.display = 'flex';
+        renderGame();
+      }
     }
 
     function startPolling() {
@@ -425,7 +476,7 @@
         }
 
         try {
-          const res = await fetch(`https://api.keyvalue.xyz/${roomCode}/tamoulState`);
+          const res = await fetch(`https://ntfy.sh/tamoul_room_sync_${roomCode}/raw`);
           if (res.ok) {
             const text = await res.text();
             if (text && text.startsWith('{')) {
@@ -437,19 +488,10 @@
         if (remoteState && JSON.stringify(remoteState) !== JSON.stringify(gameState)) {
           gameState = remoteState;
           localStorage.setItem(`tamoul_room_${roomCode}`, JSON.stringify(gameState));
-          
-          if (gameState.phase === 'LOBBY') {
-            document.getElementById('screenLobby').style.display = 'flex';
-            document.getElementById('screenGame').style.display = 'none';
-            renderLobby();
-          } else {
-            document.getElementById('screenLobby').style.display = 'none';
-            document.getElementById('screenGame').style.display = 'flex';
-            renderGame();
-          }
+          updateUI();
         }
         isFetching = false;
-      }, 1000);
+      }, 800);
     }
 
     function renderLobby() {
