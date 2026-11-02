@@ -246,6 +246,7 @@
 
     let selectedPeek = [];
     let syncInterval = null;
+    let isFetching = false;
 
     window.addEventListener('DOMContentLoaded', () => {
       const params = new URLSearchParams(window.location.search);
@@ -317,7 +318,7 @@
       } catch(e) {}
     }
 
-    function handleCreateRoomClick() {
+    async function handleCreateRoomClick() {
       myName = document.getElementById('inputPlayerName').value.trim();
       if (!myName) {
         showErrorMessage('Veuillez entrer un pseudo.');
@@ -348,7 +349,7 @@
       renderLobby();
     }
 
-    function handleJoinRoomClick() {
+    async function handleJoinRoomClick() {
       myName = document.getElementById('inputPlayerName').value.trim();
       const code = document.getElementById('inputRoomCode').value.trim().toUpperCase();
       if (!myName || !code) {
@@ -356,13 +357,23 @@
         return;
       }
 
-      const saved = localStorage.getItem(`tamoul_room_${code}`);
+      roomCode = code;
+      let saved = localStorage.getItem(`tamoul_room_${code}`);
+
       if (!saved) {
-        showErrorMessage('Salon introuvable. Vérifiez que l\'hôte a bien créé le salon !');
+        try {
+          const res = await fetch(`https://api.keyvalue.xyz/${code}/tamoulState`);
+          if (res.ok) {
+            saved = await res.text();
+          }
+        } catch(e) {}
+      }
+
+      if (!saved) {
+        showErrorMessage('Salon introuvable. Vérifiez le code ou réessayez.');
         return;
       }
 
-      roomCode = code;
       try {
         gameState = JSON.parse(saved);
       } catch(e) {}
@@ -392,32 +403,53 @@
 
     function saveState() {
       if (!roomCode) return;
-      localStorage.setItem(`tamoul_room_${roomCode}`, JSON.stringify(gameState));
+      const json = JSON.stringify(gameState);
+      localStorage.setItem(`tamoul_room_${roomCode}`, json);
+
+      fetch(`https://api.keyvalue.xyz/${roomCode}/tamoulState`, {
+        method: 'POST',
+        body: json
+      }).catch(() => {});
     }
 
     function startPolling() {
       if (syncInterval) clearInterval(syncInterval);
-      syncInterval = setInterval(() => {
-        if (!roomCode) return;
+      syncInterval = setInterval(async () => {
+        if (!roomCode || isFetching) return;
+        isFetching = true;
+
+        let remoteState = null;
         const saved = localStorage.getItem(`tamoul_room_${roomCode}`);
         if (saved) {
-          try {
-            const remoteState = JSON.parse(saved);
-            if (JSON.stringify(remoteState) !== JSON.stringify(gameState)) {
-              gameState = remoteState;
-              if (gameState.phase === 'LOBBY') {
-                document.getElementById('screenLobby').style.display = 'flex';
-                document.getElementById('screenGame').style.display = 'none';
-                renderLobby();
-              } else {
-                document.getElementById('screenLobby').style.display = 'none';
-                document.getElementById('screenGame').style.display = 'flex';
-                renderGame();
-              }
-            }
-          } catch(e) {}
+          try { remoteState = JSON.parse(saved); } catch(e) {}
         }
-      }, 400);
+
+        try {
+          const res = await fetch(`https://api.keyvalue.xyz/${roomCode}/tamoulState`);
+          if (res.ok) {
+            const text = await res.text();
+            if (text && text.startsWith('{')) {
+              remoteState = JSON.parse(text);
+            }
+          }
+        } catch(e) {}
+
+        if (remoteState && JSON.stringify(remoteState) !== JSON.stringify(gameState)) {
+          gameState = remoteState;
+          localStorage.setItem(`tamoul_room_${roomCode}`, JSON.stringify(gameState));
+          
+          if (gameState.phase === 'LOBBY') {
+            document.getElementById('screenLobby').style.display = 'flex';
+            document.getElementById('screenGame').style.display = 'none';
+            renderLobby();
+          } else {
+            document.getElementById('screenLobby').style.display = 'none';
+            document.getElementById('screenGame').style.display = 'flex';
+            renderGame();
+          }
+        }
+        isFetching = false;
+      }, 1000);
     }
 
     function renderLobby() {
