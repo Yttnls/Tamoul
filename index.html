@@ -230,7 +230,9 @@
   <script>
     let myName = '';
     let roomCode = '';
-    let myUserId = 'usr_' + Math.random().toString(36).substring(2, 7);
+    let myUserId = localStorage.getItem('tamoul_uid') || ('usr_' + Math.random().toString(36).substring(2, 7));
+    localStorage.setItem('tamoul_uid', myUserId);
+
     let gameState = {
       phase: 'LOBBY',
       players: {},
@@ -413,7 +415,7 @@
             }
           } catch(e) {}
         }
-      }, 800);
+      }, 500);
     }
 
     function renderLobby() {
