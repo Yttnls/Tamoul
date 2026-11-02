@@ -11,12 +11,10 @@
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 
-  <!-- CDN Firebase Compat -->
-  <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js"></script>
-  <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-auth-compat.js"></script>
-  <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore-compat.js"></script>
+  <!-- PeerJS pour la connexion instantanée multi-appareils sans serveur -->
+  <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
 
-  <!-- CSS animations pour les déplacements de cartes -->
+  <!-- CSS animations et thèmes apocalyptiques -->
   <style>
     @keyframes slideFromDeck {
       from { transform: translateY(-40px) scale(0.8); opacity: 0; }
@@ -25,11 +23,6 @@
     @keyframes slideToDiscard {
       from { transform: scale(1.1); opacity: 0.7; }
       to { transform: scale(1); opacity: 1; }
-    }
-    @keyframes embers {
-      0% { background-position: 0% 0%; }
-      50% { background-position: 50% 100%; }
-      100% { background-position: 100% 0%; }
     }
     .animate-draw { animation: slideFromDeck 0.3s cubic-bezier(0.34, 1.56, 0.64, 1); }
     .animate-discard { animation: slideToDiscard 0.3s ease-out; }
@@ -40,7 +33,7 @@
       background-attachment: fixed;
     }
 
-    /* Cartes simples & blanches */
+    /* Cartes simples & blanches carrées */
     .card-clean-back {
       background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
       border: 2px solid #94a3b8;
@@ -57,27 +50,7 @@
   <div id="root"></div>
 
   <script type="text/babel">
-    const { useState, useEffect } = React;
-
-    // Firebase Configuration & Initialization
-    const firebaseConfig = {
-      apiKey: "demo-api-key",
-      authDomain: "demo-app.firebaseapp.com",
-      projectId: "demo-app",
-      storageBucket: "demo-app.appspot.com",
-      messagingSenderId: "123456789",
-      appId: "1:123456789:web:123456789"
-    };
-
-    if (!firebase.apps.length) {
-      firebase.initializeApp(firebaseConfig);
-    }
-    const auth = firebase.auth();
-    const db = firebase.firestore();
-    const appId = 'tamoul-v3-room-sync';
-
-    // Broadcast channel pour la synchronisation multi-onglets
-    const channel = typeof window !== 'undefined' && window.BroadcastChannel ? new BroadcastChannel('tamoul_sync_channel') : null;
+    const { useState, useEffect, useRef } = React;
 
     const SUITS = ['♠', '♣', '♥', '♦'];
     const VALUES = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'V', 'D', 'R'];
@@ -120,123 +93,138 @@
     };
 
     function App() {
-      const [userId] = useState(() => 'user_' + Math.random().toString(36).substring(2, 9));
+      const [userId] = useState(() => 'usr_' + Math.random().toString(36).substring(2, 7));
       const [playerName, setPlayerName] = useState('');
       const [roomId, setRoomId] = useState('');
       const [inRoom, setInRoom] = useState(false);
       const [roomData, setRoomData] = useState(null);
       const [errorMessage, setErrorMessage] = useState('');
+      const [connectionStatus, setConnectionStatus] = useState('Déconnecté');
 
-      // UI Modales & Pouvoirs
+      // Modales & Pouvoirs
       const [penaltyModal, setPenaltyModal] = useState(null);
       const [peekModalCard, setPeekModalCard] = useState(null);
-      const [activePower, setActivePower] = useState(null); // 'PEEK_OWN' ou 'SWAP_SELECT_MY_CARD' ou 'SWAP_SELECT_TARGET_CARD'
+      const [activePower, setActivePower] = useState(null);
       const [swapMyCardIndex, setSwapMyCardIndex] = useState(null);
       const [selectedPeekCards, setSelectedPeekCards] = useState([]);
 
-      useEffect(() => {
-        if (!roomId || !inRoom) return;
+      // P2P Réseau Refs
+      const peerRef = useRef(null);
+      const connectionsRef = useRef([]);
+      const hostConnRef = useRef(null);
+      const roomDataRef = useRef(null);
+      roomDataRef.current = roomData;
 
-        const roomRef = db.collection('artifacts').doc(appId).collection('public').doc('rooms').collection('list').doc(roomId);
-        const unsubscribe = roomRef.onSnapshot((snap) => {
-          if (snap.exists) {
-            setRoomData(snap.data());
-          }
-        }, (err) => {
-          console.warn("Firestore sync warning:", err);
-        });
-
-        const handleMsg = (e) => {
-          if (e.data && e.data.roomId === roomId && e.data.roomData) {
-            setRoomData(e.data.roomData);
-          }
-        };
-        if (channel) channel.addEventListener('message', handleMsg);
-
-        return () => {
-          unsubscribe();
-          if (channel) channel.removeEventListener('message', handleMsg);
-        };
-      }, [roomId, inRoom]);
-
-      const updateRoomState = async (newState) => {
+      // Broadcast pour les changements de state
+      const broadcastState = (newState) => {
         setRoomData(newState);
-        if (channel) channel.postMessage({ roomId: newState.roomId, roomData: newState });
-        
-        try {
-          await db.collection('artifacts').doc(appId)
-                  .collection('public').doc('rooms')
-                  .collection('list').doc(newState.roomId).set(newState, { merge: true });
-        } catch (e) {
-          console.warn("Saving to Firestore fallback:", e);
+        // Si on est hôte, on arrose tous les joueurs
+        connectionsRef.current.forEach(conn => {
+          if (conn.open) conn.send({ type: 'SYNC_STATE', state: newState });
+        });
+        // Si on est client, on envoie à l'hôte
+        if (hostConnRef.current && hostConnRef.current.open) {
+          hostConnRef.current.send({ type: 'UPDATE_STATE', state: newState });
         }
       };
 
-      const handleCreateRoom = async () => {
+      const handleCreateRoom = () => {
         if (!playerName.trim()) return setErrorMessage('Veuillez entrer un pseudo.');
-        const code = Math.random().toString(36).substring(2, 8).toUpperCase();
-        const uId = userId || 'user_' + Math.random().toString(36).substring(2, 9);
-        const initial = {
-          roomId: code,
-          hostId: uId,
-          gameState: 'LOBBY',
-          players: { [uId]: { id: uId, name: playerName.trim(), cards: [], hasPeeked: false, score: 0 } },
-          playerOrder: [uId],
-          currentTurnIndex: 0,
-          deck: [],
-          discardPile: [],
-          drawnCard: null,
-          tamoulCalledBy: null,
-          lastAction: `${playerName.trim()} a créé le salon !`
-        };
+        const code = Math.random().toString(36).substring(2, 7).toUpperCase();
+        const peerId = `tamoul-room-${code}`;
 
-        setRoomId(code);
-        setInRoom(true);
-        setErrorMessage('');
-        setRoomData(initial);
-        await updateRoomState(initial);
-      };
+        setConnectionStatus('Création du serveur de salon...');
 
-      const handleJoinRoom = async () => {
-        if (!playerName.trim() || !roomId.trim()) return setErrorMessage('Entrez votre pseudo et le code.');
-        const code = roomId.trim().toUpperCase();
-        const uId = userId || 'user_' + Math.random().toString(36).substring(2, 9);
+        const peer = new Peer(peerId);
+        peerRef.current = peer;
 
-        let curr = null;
-        try {
-          const snap = await db.collection('artifacts').doc(appId).collection('public').doc('rooms').collection('list').doc(code).get();
-          if (snap.exists) curr = snap.data();
-        } catch(e) {}
-
-        if (!curr && roomData && roomData.roomId === code) curr = roomData;
-        
-        if (!curr) {
-          curr = {
+        peer.on('open', (id) => {
+          setConnectionStatus('Salon créé !');
+          const uId = userId;
+          const initial = {
             roomId: code,
             hostId: uId,
             gameState: 'LOBBY',
-            players: {},
-            playerOrder: [],
+            players: { [uId]: { id: uId, name: playerName.trim(), cards: [], hasPeeked: false, score: 0 } },
+            playerOrder: [uId],
             currentTurnIndex: 0,
             deck: [],
             discardPile: [],
             drawnCard: null,
-            tamoulCalledBy: null
+            tamoulCalledBy: null,
+            lastAction: `${playerName.trim()} a créé le salon !`
           };
-        }
+          setRoomId(code);
+          setInRoom(true);
+          setRoomData(initial);
+        });
 
-        const updatedPlayers = { ...curr.players, [uId]: { id: uId, name: playerName.trim(), cards: [], hasPeeked: false, score: 0 } };
-        const updatedOrder = curr.playerOrder.includes(uId) ? curr.playerOrder : [...curr.playerOrder, uId];
-        const updatedState = { ...curr, players: updatedPlayers, playerOrder: updatedOrder, lastAction: `${playerName.trim()} a rejoint le salon.` };
-        
-        setRoomId(code);
-        setInRoom(true);
-        setErrorMessage('');
-        setRoomData(updatedState);
-        await updateRoomState(updatedState);
+        peer.on('connection', (conn) => {
+          connectionsRef.current.push(conn);
+          conn.on('data', (data) => {
+            if (data.type === 'JOIN_REQUEST') {
+              const current = roomDataRef.current;
+              const newPlayerId = data.player.id;
+              const updatedPlayers = { ...current.players, [newPlayerId]: data.player };
+              const updatedOrder = current.playerOrder.includes(newPlayerId) ? current.playerOrder : [...current.playerOrder, newPlayerId];
+              const newState = {
+                ...current,
+                players: updatedPlayers,
+                playerOrder: updatedOrder,
+                lastAction: `${data.player.name} a rejoint la partie !`
+              };
+              broadcastState(newState);
+            } else if (data.type === 'UPDATE_STATE') {
+              broadcastState(data.state);
+            }
+          });
+        });
+
+        peer.on('error', (err) => {
+          setErrorMessage('Erreur d’initialisation du salon. Réessayez.');
+        });
       };
 
-      const handleStartGame = async () => {
+      const handleJoinRoom = () => {
+        if (!playerName.trim() || !roomId.trim()) return setErrorMessage('Entrez votre pseudo et le code.');
+        const code = roomId.trim().toUpperCase();
+        const hostPeerId = `tamoul-room-${code}`;
+
+        setConnectionStatus('Connexion au salon...');
+
+        const peer = new Peer();
+        peerRef.current = peer;
+
+        peer.on('open', () => {
+          const conn = peer.connect(hostPeerId);
+          hostConnRef.current = conn;
+
+          conn.on('open', () => {
+            setConnectionStatus('Connecté au salon !');
+            setInRoom(true);
+            conn.send({
+              type: 'JOIN_REQUEST',
+              player: { id: userId, name: playerName.trim(), cards: [], hasPeeked: false, score: 0 }
+            });
+          });
+
+          conn.on('data', (data) => {
+            if (data.type === 'SYNC_STATE') {
+              setRoomData(data.state);
+            }
+          });
+
+          conn.on('error', () => {
+            setErrorMessage('Impossible de rejoindre ce salon. Vérifiez le code.');
+          });
+        });
+
+        peer.on('error', () => {
+          setErrorMessage('Code de salon introuvable ou inactif.');
+        });
+      };
+
+      const handleStartGame = () => {
         const deck = createDeck();
         const players = { ...roomData.players };
         roomData.playerOrder.forEach(id => {
@@ -244,7 +232,7 @@
           players[id].hasPeeked = false;
         });
         const initialDiscard = [deck.pop()];
-        await updateRoomState({
+        broadcastState({
           ...roomData,
           gameState: 'PEEKING',
           deck,
@@ -257,15 +245,14 @@
         });
       };
 
-      const handleFinishPeeking = async () => {
+      const handleFinishPeeking = () => {
         const resetCards = roomData.players[userId].cards.map(c => ({ ...c, isFaceUp: false }));
-        
         const updatedPlayers = {
           ...roomData.players,
           [userId]: { ...roomData.players[userId], cards: resetCards, hasPeeked: true }
         };
         const allPeeked = roomData.playerOrder.every(id => updatedPlayers[id].hasPeeked);
-        await updateRoomState({
+        broadcastState({
           ...roomData,
           players: updatedPlayers,
           gameState: allPeeked ? 'PLAYING' : 'PEEKING',
@@ -274,7 +261,7 @@
         setSelectedPeekCards([]);
       };
 
-      const handleDrawFromDeck = async () => {
+      const handleDrawFromDeck = () => {
         if (!roomData || roomData.gameState !== 'PLAYING') return;
         if (roomData.playerOrder[roomData.currentTurnIndex] !== userId) return;
         if (roomData.drawnCard) return;
@@ -294,7 +281,7 @@
         }
 
         const drawnCard = currentDeck.pop();
-        await updateRoomState({
+        broadcastState({
           ...roomData,
           deck: currentDeck,
           discardPile: currentDiscard,
@@ -303,22 +290,20 @@
         });
       };
 
-      const nextTurn = async (currentState = roomData) => {
+      const nextTurn = (currentState = roomData) => {
         let nextIdx = (currentState.currentTurnIndex + 1) % currentState.playerOrder.length;
-        
         if (currentState.tamoulCalledBy !== null && currentState.playerOrder[nextIdx] === currentState.tamoulCalledBy) {
           finishGame(currentState);
           return;
         }
-
-        await updateRoomState({
+        broadcastState({
           ...currentState,
           currentTurnIndex: nextIdx,
           lastAction: `Tour à ${currentState.players[currentState.playerOrder[nextIdx]].name}.`
         });
       };
 
-      const handleSwapDrawnWithHand = async (handIndex) => {
+      const handleSwapDrawnWithHand = (handIndex) => {
         if (!roomData || !roomData.drawnCard) return;
         if (roomData.playerOrder[roomData.currentTurnIndex] !== userId) return;
 
@@ -343,16 +328,16 @@
 
         if (oldCardObj.card.isRed && oldCardObj.card.val === 'D') {
           setActivePower('PEEK_OWN');
-          await updateRoomState({ ...updatedState, lastAction: `👑 Pouvoir Dame Rouge ! ${myPlayer.name} peut regarder une de ses cartes.` });
+          broadcastState({ ...updatedState, lastAction: `👑 Pouvoir Dame Rouge ! ${myPlayer.name} peut regarder une de ses cartes.` });
         } else if (oldCardObj.card.isRed && oldCardObj.card.val === 'V') {
           setActivePower('SWAP_SELECT_MY_CARD');
-          await updateRoomState({ ...updatedState, lastAction: `🃏 Pouvoir Valet Rouge ! ${myPlayer.name} peut échanger une carte avec un autre joueur.` });
+          broadcastState({ ...updatedState, lastAction: `🃏 Pouvoir Valet Rouge ! ${myPlayer.name} peut échanger une carte avec un autre joueur.` });
         } else {
-          await nextTurn(updatedState);
+          nextTurn(updatedState);
         }
       };
 
-      const handleDiscardDrawn = async () => {
+      const handleDiscardDrawn = () => {
         if (!roomData || !roomData.drawnCard) return;
         if (roomData.playerOrder[roomData.currentTurnIndex] !== userId) return;
 
@@ -368,26 +353,25 @@
 
         if (discarded.isRed && discarded.val === 'D') {
           setActivePower('PEEK_OWN');
-          await updateRoomState({ ...updatedState, lastAction: `👑 Pouvoir Dame Rouge ! ${roomData.players[userId].name} peut regarder une de ses cartes.` });
+          broadcastState({ ...updatedState, lastAction: `👑 Pouvoir Dame Rouge ! ${roomData.players[userId].name} peut regarder une de ses cartes.` });
         } else if (discarded.isRed && discarded.val === 'V') {
           setActivePower('SWAP_SELECT_MY_CARD');
-          await updateRoomState({ ...updatedState, lastAction: `🃏 Pouvoir Valet Rouge ! ${roomData.players[userId].name} peut échanger une carte avec un autre joueur.` });
+          broadcastState({ ...updatedState, lastAction: `🃏 Pouvoir Valet Rouge ! ${roomData.players[userId].name} peut échanger une carte avec un autre joueur.` });
         } else {
-          await nextTurn(updatedState);
+          nextTurn(updatedState);
         }
       };
 
-      const handleCardClickWithPower = async (idx, targetPlayerId = null) => {
+      const handleCardClickWithPower = (idx, targetPlayerId = null) => {
         if (activePower === 'PEEK_OWN') {
           const cardObj = roomData.players[userId].cards[idx];
           setPeekModalCard(cardObj.card);
           setActivePower(null);
-          await nextTurn();
+          nextTurn();
         } else if (activePower === 'SWAP_SELECT_MY_CARD') {
           setSwapMyCardIndex(idx);
           setActivePower('SWAP_SELECT_TARGET_CARD');
         } else if (activePower === 'SWAP_SELECT_TARGET_CARD' && targetPlayerId && targetPlayerId !== userId) {
-          // Échange des deux cartes
           const myHand = [...roomData.players[userId].cards];
           const targetHand = [...roomData.players[targetPlayerId].cards];
 
@@ -409,11 +393,11 @@
 
           setActivePower(null);
           setSwapMyCardIndex(null);
-          await nextTurn(newState);
+          nextTurn(newState);
         }
       };
 
-      const handleReflexCut = async (handIndex) => {
+      const handleReflexCut = (handIndex) => {
         if (!roomData || roomData.gameState !== 'PLAYING') return;
         if (roomData.discardPile.length === 0) return;
 
@@ -425,7 +409,7 @@
         if (playedCardObj.card.val === topDiscard.val) {
           const newHand = myPlayer.cards.filter((_, idx) => idx !== handIndex);
           const newDiscard = [...roomData.discardPile, playedCardObj.card];
-          await updateRoomState({
+          broadcastState({
             ...roomData,
             players: { ...roomData.players, [userId]: { ...myPlayer, cards: newHand } },
             discardPile: newDiscard,
@@ -438,7 +422,7 @@
           updatedHand[handIndex] = { ...playedCardObj, isFaceUp: true };
           if (penaltyCard) updatedHand.push({ card: penaltyCard, isFaceUp: false });
 
-          await updateRoomState({
+          broadcastState({
             ...roomData,
             players: { ...roomData.players, [userId]: { ...myPlayer, cards: updatedHand } },
             deck: currentDeck,
@@ -454,18 +438,18 @@
         }
       };
 
-      const handleCallTamoul = async () => {
+      const handleCallTamoul = () => {
         if (!roomData || roomData.gameState !== 'PLAYING') return;
         if (roomData.tamoulCalledBy !== null) return;
 
-        await updateRoomState({
+        broadcastState({
           ...roomData,
           tamoulCalledBy: userId,
           lastAction: `🔔 TAMOUL ! ${roomData.players[userId].name} a annoncé TAMOUL ! Dernier tour.`
         });
       };
 
-      const finishGame = async (currentState = roomData) => {
+      const finishGame = (currentState = roomData) => {
         const players = { ...currentState.players };
         let minScore = Infinity;
         let winnerId = null;
@@ -482,12 +466,12 @@
           }
         });
 
-        await updateRoomState({
+        broadcastState({
           ...currentState,
           players,
           gameState: 'GAME_OVER',
           winnerId,
-          lastAction: `🏆 FIN DE PARTIE ! ${players[winnerId]?.name} gagne avec le plus bas score (${minScore} pts) !`
+          lastAction: `🏆 FIN DE PARTIE ! ${players[winnerId]?.name} gagne avec ${minScore} pts !`
         });
       };
 
@@ -532,17 +516,17 @@
             <div className="bg-slate-950/85 backdrop-blur-md border-2 border-orange-600/70 p-6 sm:p-8 rounded-none max-w-sm w-full text-center shadow-[0_0_40px_rgba(234,88,12,0.4)]">
               <h1 className="text-4xl font-black text-amber-500 mb-1 tracking-widest font-mono drop-shadow-[0_0_10px_rgba(245,158,11,0.8)]">TAMOUL</h1>
               <p className="text-[10px] text-orange-300 font-mono tracking-widest mb-6 uppercase">SURVIVAL CARD GAME</p>
-              {errorMessage && <p className="text-xs text-rose-400 mb-4">{errorMessage}</p>}
+              {errorMessage && <p className="text-xs text-rose-400 mb-4 font-mono">{errorMessage}</p>}
               <input
                 type="text" placeholder="VOTRE PSEUDO" value={playerName} onChange={e=>setPlayerName(e.target.value)}
                 className="w-full bg-slate-900 border border-slate-700 p-3 rounded-none mb-4 text-white text-center font-mono focus:border-amber-500 focus:outline-none tracking-wider"
               />
-              <button onClick={handleCreateRoom} className="w-full bg-amber-500 hover:bg-amber-400 text-slate-950 font-black p-3.5 rounded-none mb-3 shadow-[0_0_15px_rgba(245,158,11,0.5)] transition uppercase tracking-widest">
+              <button onClick={handleCreateRoom} className="w-full bg-amber-500 hover:bg-amber-400 text-slate-950 font-black p-3.5 rounded-none mb-3 shadow-[0_0_15px_rgba(245,158,11,0.5)] transition uppercase tracking-widest font-mono">
                 Créer un salon
               </button>
               <div className="flex gap-2">
                 <input type="text" placeholder="CODE SALON" value={roomId} onChange={e=>setRoomId(e.target.value.toUpperCase())} className="w-full bg-slate-900 border border-slate-700 p-3 rounded-none text-center uppercase font-mono tracking-wider focus:border-orange-500 focus:outline-none" />
-                <button onClick={handleJoinRoom} className="bg-orange-600 hover:bg-orange-500 text-white font-black px-4 rounded-none shadow-[0_0_15px_rgba(234,88,12,0.5)] transition uppercase">Entrer</button>
+                <button onClick={handleJoinRoom} className="bg-orange-600 hover:bg-orange-500 text-white font-black px-4 rounded-none shadow-[0_0_15px_rgba(234,88,12,0.5)] transition uppercase font-mono">Entrer</button>
               </div>
             </div>
           </div>
@@ -580,12 +564,12 @@
 
           <header className="w-full max-w-2xl flex justify-between items-center bg-slate-950/80 border border-orange-500/40 p-4 rounded-none shadow-lg font-mono">
             <span className="font-bold text-amber-400 tracking-wider">SALON : <span className="text-white">{roomId}</span></span>
-            <span className="text-xs text-orange-300">{Object.keys(roomData?.players || {}).length} JOUEURS</span>
+            <span className="text-xs text-orange-300">{Object.keys(roomData?.players || {}).length} JOUEUR(S)</span>
           </header>
 
           {roomData?.gameState === 'LOBBY' ? (
             <div className="bg-slate-950/85 border-2 border-orange-600/60 p-6 rounded-none max-w-md w-full text-center shadow-2xl my-auto font-mono">
-              <h2 className="text-xl font-bold mb-4 text-slate-200">CODE : <span className="text-amber-400 font-bold">{roomId}</span></h2>
+              <h2 className="text-xl font-bold mb-4 text-slate-200">CODE SALON : <span className="text-amber-400 font-bold">{roomId}</span></h2>
               <div className="space-y-2 mb-6">
                 {Object.values(roomData.players).map(p => (
                   <div key={p.id} className="bg-slate-900/90 border border-slate-800 p-3 rounded-none text-sm font-semibold flex justify-between">
@@ -595,11 +579,11 @@
                 ))}
               </div>
               {isHost ? (
-                <button onClick={handleStartGame} className="w-full bg-amber-500 hover:bg-amber-400 text-slate-950 font-black p-3.5 rounded-none tracking-widest uppercase transition">
+                <button onClick={handleStartGame} className="w-full bg-amber-500 hover:bg-amber-400 text-slate-950 font-black p-3.5 rounded-none tracking-widest uppercase transition font-mono">
                   LANCER LA PARTIE
                 </button>
               ) : (
-                <p className="text-xs text-slate-400 italic">En attente de l'hôte...</p>
+                <p className="text-xs text-slate-400 italic font-mono">En attente que l'hôte lance la partie...</p>
               )}
             </div>
           ) : (
@@ -734,7 +718,7 @@
                     ))}
                 </div>
                 {isHost && (
-                  <button onClick={handleStartGame} className="w-full bg-amber-500 text-slate-950 font-black p-3 rounded-none uppercase tracking-widest">
+                  <button onClick={handleStartGame} className="w-full bg-amber-500 text-slate-950 font-black p-3 rounded-none uppercase tracking-widest font-mono">
                     Rejouer
                   </button>
                 )}
