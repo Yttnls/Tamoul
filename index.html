@@ -247,6 +247,10 @@
     let selectedPeek = [];
     let syncInterval = null;
 
+    // Synchronisation Cloud universelle (JSONBin public gratuit)
+    const BIN_API_URL = 'https://api.jsonbin.io/v3/b';
+    const MASTER_KEY = '$2a$10$wK1x...'; // Fallback stocké local + distant
+
     window.addEventListener('DOMContentLoaded', () => {
       const params = new URLSearchParams(window.location.search);
       const salonParam = params.get('salon');
@@ -358,7 +362,7 @@
 
       const saved = localStorage.getItem(`tamoul_room_${code}`);
       if (!saved) {
-        showErrorMessage('Salon introuvable. Vérifiez que l\'hôte a bien créé le salon !');
+        showErrorMessage('Salon introuvable. Vérifiez que l\'hôte a bien créé le salon sur ce navigateur ou partagez le lien direct !');
         return;
       }
 
