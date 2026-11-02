@@ -115,12 +115,34 @@
       const roomDataRef = useRef(null);
       roomDataRef.current = roomData;
 
+      // Broadcast channel local pour synchronisation onglets locaux
+      const localChannelRef = useRef(null);
+
+      useEffect(() => {
+        try {
+          if (typeof window !== 'undefined' && window.BroadcastChannel) {
+            localChannelRef.current = new BroadcastChannel('tamoul_room_channel');
+            localChannelRef.current.onmessage = (e) => {
+              if (e.data && e.data.roomId === roomId && e.data.state) {
+                setRoomData(e.data.state);
+              }
+            };
+          }
+        } catch(e) {}
+        return () => {
+          if (localChannelRef.current) localChannelRef.current.close();
+        };
+      }, [roomId]);
+
       // Broadcast pour les changements de state
       const broadcastState = (newState) => {
         setRoomData(newState);
-        // Si on est hôte, on arrose tous les joueurs
+        if (localChannelRef.current) {
+          localChannelRef.current.postMessage({ roomId: newState.roomId, state: newState });
+        }
+        // Si on est hôte, on arrose tous les joueurs connectés
         connectionsRef.current.forEach(conn => {
-          if (conn.open) conn.send({ type: 'SYNC_STATE', state: newState });
+          if (conn && conn.open) conn.send({ type: 'SYNC_STATE', state: newState });
         });
         // Si on est client, on envoie à l'hôte
         if (hostConnRef.current && hostConnRef.current.open) {
@@ -131,70 +153,67 @@
       const handleCreateRoom = () => {
         if (!playerName.trim()) return setErrorMessage('Veuillez entrer un pseudo.');
         const code = Math.random().toString(36).substring(2, 7).toUpperCase();
-        const peerId = `tamoul-room-${code}`;
+        const uId = userId;
+        
+        const initial = {
+          roomId: code,
+          hostId: uId,
+          gameState: 'LOBBY',
+          players: { [uId]: { id: uId, name: playerName.trim(), cards: [], hasPeeked: false, score: 0 } },
+          playerOrder: [uId],
+          currentTurnIndex: 0,
+          deck: [],
+          discardPile: [],
+          drawnCard: null,
+          tamoulCalledBy: null,
+          lastAction: `${playerName.trim()} a créé le salon !`
+        };
 
-        setConnectionStatus('Création du serveur de salon...');
+        // Affichage du salon immédiat
+        setRoomId(code);
+        setInRoom(true);
+        setRoomData(initial);
+        setConnectionStatus('Salon créé !');
 
-        const peer = new Peer(peerId);
-        peerRef.current = peer;
+        // Initialisation PeerJS Hôte
+        try {
+          const cleanCode = code.toLowerCase();
+          const peer = new Peer(`tamoul-${cleanCode}`);
+          peerRef.current = peer;
 
-        peer.on('open', (id) => {
-          setConnectionStatus('Salon créé !');
-          const uId = userId;
-          const initial = {
-            roomId: code,
-            hostId: uId,
-            gameState: 'LOBBY',
-            players: { [uId]: { id: uId, name: playerName.trim(), cards: [], hasPeeked: false, score: 0 } },
-            playerOrder: [uId],
-            currentTurnIndex: 0,
-            deck: [],
-            discardPile: [],
-            drawnCard: null,
-            tamoulCalledBy: null,
-            lastAction: `${playerName.trim()} a créé le salon !`
-          };
-          setRoomId(code);
-          setInRoom(true);
-          setRoomData(initial);
-        });
-
-        peer.on('connection', (conn) => {
-          connectionsRef.current.push(conn);
-          conn.on('data', (data) => {
-            if (data.type === 'JOIN_REQUEST') {
-              const current = roomDataRef.current;
-              const newPlayerId = data.player.id;
-              const updatedPlayers = { ...current.players, [newPlayerId]: data.player };
-              const updatedOrder = current.playerOrder.includes(newPlayerId) ? current.playerOrder : [...current.playerOrder, newPlayerId];
-              const newState = {
-                ...current,
-                players: updatedPlayers,
-                playerOrder: updatedOrder,
-                lastAction: `${data.player.name} a rejoint la partie !`
-              };
-              broadcastState(newState);
-            } else if (data.type === 'UPDATE_STATE') {
-              broadcastState(data.state);
-            }
+          peer.on('connection', (conn) => {
+            connectionsRef.current.push(conn);
+            conn.on('data', (data) => {
+              if (data.type === 'JOIN_REQUEST') {
+                const current = roomDataRef.current || initial;
+                const newPlayerId = data.player.id;
+                const updatedPlayers = { ...current.players, [newPlayerId]: data.player };
+                const updatedOrder = current.playerOrder.includes(newPlayerId) ? current.playerOrder : [...current.playerOrder, newPlayerId];
+                const newState = {
+                  ...current,
+                  players: updatedPlayers,
+                  playerOrder: updatedOrder,
+                  lastAction: `${data.player.name} a rejoint la partie !`
+                };
+                broadcastState(newState);
+              } else if (data.type === 'UPDATE_STATE') {
+                broadcastState(data.state);
+              }
+            });
           });
-        });
-
-        peer.on('error', (err) => {
-          setErrorMessage('Erreur d’initialisation du salon. Réessayez.');
-        });
+        } catch (e) {
+          console.warn("PeerJS non disponible, passage en réseau local.");
+        }
       };
 
       const handleJoinRoom = () => {
         if (!playerName.trim() || !roomId.trim()) return setErrorMessage('Entrez votre pseudo et le code.');
         const code = roomId.trim().toUpperCase();
-        const hostPeerId = `tamoul-room-${code}`;
         const uId = userId;
 
         setErrorMessage('');
-        setConnectionStatus('Connexion au salon...');
         
-        // Basculement UI immédiat pour ne pas bloquer l'utilisateur
+        // Basculement UI immédiat
         const tempRoomData = {
           roomId: code,
           hostId: 'pending',
@@ -206,14 +225,17 @@
           discardPile: [],
           drawnCard: null,
           tamoulCalledBy: null,
-          lastAction: `${playerName.trim()} rejoint le salon...`
+          lastAction: `${playerName.trim()} se connecte au salon ${code}...`
         };
 
         setRoomId(code);
         setInRoom(true);
         setRoomData(tempRoomData);
+        setConnectionStatus('Connexion...');
 
+        // Connexion PeerJS vers l'Hôte
         try {
+          const hostPeerId = `tamoul-${code.toLowerCase()}`;
           const peer = new Peer();
           peerRef.current = peer;
 
@@ -222,7 +244,7 @@
             hostConnRef.current = conn;
 
             conn.on('open', () => {
-              setConnectionStatus('Connecté au salon !');
+              setConnectionStatus('Connecté !');
               conn.send({
                 type: 'JOIN_REQUEST',
                 player: { id: userId, name: playerName.trim(), cards: [], hasPeeked: false, score: 0 }
@@ -236,15 +258,113 @@
             });
 
             conn.on('error', () => {
-              setErrorMessage('Connexion hôte ralentie...');
+              setConnectionStatus('Erreur de connexion');
             });
           });
-
-          peer.on('error', () => {
-            setConnectionStatus('Recherche du salon...');
-          });
         } catch (e) {
-          console.warn("Connexion secours activée.");
+          console.warn("Erreur d'initialisation PeerJS.");
+        }
+      };
+
+      const handleStartGame = () => {
+        if (!roomData) return;
+        const deck = createDeck();
+        const players = { ...roomData.players };
+        roomData.playerOrder.forEach(id => {
+          players[id].cards = deck.splice(0, 4).map(c => ({ card: c, isFaceUp: false }));
+        });
+        const initialDiscard = [deck.pop()];
+        const newState = {
+          ...roomData,
+          gameState: 'PEEKING',
+          deck,
+          discardPile: initialDiscard,
+          players,
+          currentTurnIndex: 0,
+          lastAction: 'Partie lancée ! Choisissez 2 cartes à mémoriser.'
+        };
+        broadcastState(newState);
+      };
+
+      const handleFinishPeeking = () => {
+        if (!roomData || !userId) return;
+        const updatedPlayers = {
+          ...roomData.players,
+          [userId]: { ...roomData.players[userId], hasPeeked: true }
+        };
+        const allPeeked = roomData.playerOrder.every(id => updatedPlayers[id]?.hasPeeked);
+
+        const newState = {
+          ...roomData,
+          players: updatedPlayers,
+          gameState: allPeeked ? 'PLAYING' : 'PEEKING',
+          lastAction: allPeeked ? 'Chacun a mémorisé ses cartes ! Le premier tour commence.' : `${roomData.players[userId].name} est prêt !`
+        };
+        broadcastState(newState);
+        setSelectedPeekCards([]);
+      };
+
+      const handleDrawFromDeck = () => {
+        if (!roomData || roomData.gameState !== 'PLAYING') return;
+        if (roomData.playerOrder[roomData.currentTurnIndex] !== userId) return;
+        if (roomData.drawnCard) return;
+
+        let deck = [...roomData.deck];
+        let discardPile = [...roomData.discardPile];
+
+        if (deck.length === 0) {
+          if (discardPile.length <= 1) return;
+          const topDiscard = discardPile.pop();
+          deck = [...discardPile];
+          for (let i = deck.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [deck[i], deck[j]] = [deck[j], deck[i]];
+          }
+          discardPile = [topDiscard];
+        }
+
+        const drawnCard = deck.pop();
+        const newState = {
+          ...roomData,
+          deck,
+          discardPile,
+          drawnCard,
+          lastAction: `${roomData.players[userId].name} a pioché une carte.`
+        };
+        broadcastState(newState);
+      };
+
+      const handleSwapDrawnWithHand = (handIndex) => {
+        if (!roomData || !roomData.drawnCard) return;
+        if (roomData.playerOrder[roomData.currentTurnIndex] !== userId) return;
+
+        const myPlayer = roomData.players[userId];
+        const oldCardObj = myPlayer.cards[handIndex];
+        const newHand = [...myPlayer.cards];
+        newHand[handIndex] = { card: roomData.drawnCard, isFaceUp: false };
+
+        const newDiscard = [...roomData.discardPile, oldCardObj.card];
+        const updatedPlayers = {
+          ...roomData.players,
+          [userId]: { ...myPlayer, cards: newHand }
+        };
+
+        const newState = {
+          ...roomData,
+          players: updatedPlayers,
+          discardPile: newDiscard,
+          drawnCard: null,
+          lastAction: `${myPlayer.name} a échangé une carte et défaussé.`
+        };
+
+        if (oldCardObj.card.isRed && oldCardObj.card.val === 'D') {
+          setActivePower('PEEK_OWN');
+          broadcastState({ ...newState, lastAction: `👑 Pouvoir Dame Rouge ! ${myPlayer.name} peut regarder une carte.` });
+        } else if (oldCardObj.card.isRed && oldCardObj.card.val === 'V') {
+          setActivePower('SWAP_SELECT_MY_CARD');
+          broadcastState({ ...newState, lastAction: `🃏 Pouvoir Valet Rouge ! ${myPlayer.name} peut échanger une carte avec un adversaire.` });
+        } else {
+          nextTurn(newState);
         }
       };
 
@@ -255,7 +375,7 @@
         const discarded = roomData.drawnCard;
         const newDiscard = [...roomData.discardPile, discarded];
 
-        const updatedState = {
+        const newState = {
           ...roomData,
           discardPile: newDiscard,
           drawnCard: null,
@@ -264,13 +384,30 @@
 
         if (discarded.isRed && discarded.val === 'D') {
           setActivePower('PEEK_OWN');
-          broadcastState({ ...updatedState, lastAction: `👑 Pouvoir Dame Rouge ! ${roomData.players[userId].name} peut regarder une de ses cartes.` });
+          broadcastState({ ...newState, lastAction: `👑 Pouvoir Dame Rouge ! ${roomData.players[userId].name} peut regarder une de ses cartes.` });
         } else if (discarded.isRed && discarded.val === 'V') {
           setActivePower('SWAP_SELECT_MY_CARD');
-          broadcastState({ ...updatedState, lastAction: `🃏 Pouvoir Valet Rouge ! ${roomData.players[userId].name} peut échanger une carte avec un autre joueur.` });
+          broadcastState({ ...newState, lastAction: `🃏 Pouvoir Valet Rouge ! ${roomData.players[userId].name} peut échanger une carte.` });
         } else {
-          nextTurn(updatedState);
+          nextTurn(newState);
         }
+      };
+
+      const nextTurn = (currentState = roomData) => {
+        if (!currentState) return;
+        const nextIndex = (currentState.currentTurnIndex + 1) % currentState.playerOrder.length;
+        
+        if (currentState.tamoulCalledBy !== null && nextIndex === currentState.playerOrder.indexOf(currentState.tamoulCalledBy)) {
+          finishGame(currentState);
+          return;
+        }
+
+        const newState = {
+          ...currentState,
+          currentTurnIndex: nextIndex,
+          lastAction: `C'est au tour de ${currentState.players[currentState.playerOrder[nextIndex]].name}.`
+        };
+        broadcastState(newState);
       };
 
       const handleCardClickWithPower = (idx, targetPlayerId = null) => {
@@ -475,7 +612,7 @@
 
           <header className="w-full max-w-2xl flex justify-between items-center bg-slate-950/80 border border-orange-500/40 p-4 rounded-none shadow-lg font-mono">
             <span className="font-bold text-amber-400 tracking-wider">SALON : <span className="text-white">{roomId}</span></span>
-            <span className="text-xs text-orange-300">{Object.keys(roomData?.players || {}).length} JOUEUR(S)</span>
+            <span className="text-xs text-orange-300">{connectionStatus} | {Object.keys(roomData?.players || {}).length} JOUEUR(S)</span>
           </header>
 
           {roomData?.gameState === 'LOBBY' ? (
