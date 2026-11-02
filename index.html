@@ -50,16 +50,12 @@
             <li><strong>Dames et Valets Rouges (♥/♦) en main :</strong> 10 points de pénalité.</li>
           </ul>
         </div>
-        <div>
-          <h4 class="font-bold text-white mb-1">3. Le Réflexe (« Couper »)</h4>
-          <p>À tout moment, si la carte du dessus de la défausse correspond à l'une de vos cartes, cliquez sur <strong>« Couper »</strong> pour la jeter directement dans la défausse ! Attention en cas d'erreur, vous prenez une carte de pénalité.</p>
-        </div>
       </div>
       <button 
         onclick="document.getElementById('introRulesModal').style.display='none'"
         class="mt-6 w-full bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold py-3 transition shadow-lg uppercase tracking-wider cursor-pointer"
       >
-        OK, j'ai compris ! Let's go
+        OK, c'est compris ! Let's go
       </button>
     </div>
   </div>
@@ -83,10 +79,10 @@
       <h3 class="text-xl font-bold text-amber-400 mb-4">📖 Règles & Valeurs des cartes</h3>
       <div class="space-y-4 text-sm text-slate-300 leading-relaxed text-left max-h-[65vh] overflow-y-auto pr-2">
         <div class="bg-amber-500/10 border-l-4 border-amber-500 p-3 text-amber-200">
-          🎯 <strong>Objectif :</strong> Avoir le score le plus faible possible ou se débarrasser de ses cartes.
+          🎯 <strong>Objectif :</strong> Avoir le score le plus faible possible.
         </div>
         <div>
-          <h4 class="font-bold text-white mb-1">Valeurs des Cartes</h4>
+          <h4 class="font-bold text-white mb-1">Valeurs</h4>
           <p>Rois rouges & Jokers = 0 pts | Chiffres = valeur nominale | Figures = 10 pts.</p>
         </div>
       </div>
@@ -156,7 +152,7 @@
       <h2 class="text-xl font-bold text-amber-400 mb-4">Salon d'attente</h2>
       
       <div class="bg-slate-950 border border-slate-700 p-4 mb-4 text-center w-full">
-        <p class="text-xs text-slate-400 mb-1">Code du salon :</p>
+        <p class="text-xs text-slate-400 mb-1">Code du salon à partager :</p>
         <span id="displayRoomCode" class="text-3xl font-black tracking-widest text-amber-400 font-mono"></span>
       </div>
 
@@ -175,13 +171,17 @@
         <div id="playersList" class="space-y-2"></div>
       </div>
 
-      <button
-        id="btnStartGame"
-        onclick="startGame()"
-        class="w-full py-3 font-bold uppercase tracking-wider transition bg-emerald-600 hover:bg-emerald-500 text-white cursor-pointer"
-      >
-        Lancer la partie
-      </button>
+      <div id="hostControls" class="w-full hidden">
+        <button
+          onclick="startGame()"
+          class="w-full py-3 font-bold uppercase tracking-wider transition bg-emerald-600 hover:bg-emerald-500 text-white cursor-pointer shadow"
+        >
+          Lancer la partie
+        </button>
+      </div>
+      <div id="guestWaiting" class="w-full text-center text-sm text-slate-400 italic">
+        En attente que l'hôte lance la partie...
+      </div>
     </div>
 
     <!-- Écran Jeu -->
@@ -212,7 +212,7 @@
       <div class="w-full max-w-md bg-slate-900/95 border border-slate-700 p-4 flex flex-col items-center shadow-2xl">
         <div class="w-full flex justify-between items-center mb-3">
           <span class="text-xs font-bold text-amber-400 uppercase">Vos cartes (2x2)</span>
-          <button id="btnTamoul" onclick="callTamoul()" class="bg-red-600 hover:bg-red-500 text-white font-black text-xs px-3 py-1 shadow cursor-pointer">🔔 TAMOUL</button>
+          <button onclick="callTamoul()" class="bg-red-600 hover:bg-red-500 text-white font-black text-xs px-3 py-1 shadow cursor-pointer">🔔 TAMOUL</button>
         </div>
 
         <div id="myHandGrid" class="grid grid-cols-2 gap-3 my-2"></div>
@@ -235,6 +235,7 @@
 
     let gameState = {
       phase: 'LOBBY',
+      hostId: '',
       players: {},
       playerOrder: [],
       turnIndex: 0,
@@ -326,6 +327,7 @@
       
       gameState = {
         phase: 'LOBBY',
+        hostId: myUserId,
         players: {
           [myUserId]: { id: myUserId, name: myName, cards: [], hasPeeked: false, score: 0 }
         },
@@ -415,7 +417,7 @@
             }
           } catch(e) {}
         }
-      }, 500);
+      }, 400);
     }
 
     function renderLobby() {
@@ -424,9 +426,17 @@
       Object.values(gameState.players).forEach(p => {
         const div = document.createElement('div');
         div.className = 'bg-slate-950 border border-slate-800 px-4 py-3 flex justify-between items-center';
-        div.innerHTML = `<span class="font-bold">${p.name} ${p.id === gameState.playerOrder[0] ? '(Hôte)' : ''}</span>`;
+        div.innerHTML = `<span class="font-bold">${p.name} ${p.id === gameState.hostId ? '(Hôte)' : ''}</span>`;
         list.appendChild(div);
       });
+
+      if (gameState.hostId === myUserId) {
+        document.getElementById('hostControls').style.display = 'block';
+        document.getElementById('guestWaiting').style.display = 'none';
+      } else {
+        document.getElementById('hostControls').style.display = 'none';
+        document.getElementById('guestWaiting').style.display = 'block';
+      }
     }
 
     function startGame() {
