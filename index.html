@@ -109,21 +109,24 @@ export default function App() {
   const hostConnsRef = useRef({});
 
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const salonParam = params.get('salon');
-    if (salonParam) {
-      setRoomId(salonParam.toUpperCase());
-    }
+    if (typeof window !== 'undefined') {
+      const params = new URLSearchParams(window.location.search);
+      const salonParam = params.get('salon');
+      if (salonParam) {
+        setRoomId(salonParam.toUpperCase());
+      }
 
-    if (!window.Peer) {
-      const script = document.createElement('script');
-      script.src = 'https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js';
-      script.async = true;
-      document.body.appendChild(script);
+      if (!window.Peer) {
+        const script = document.createElement('script');
+        script.src = 'https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js';
+        script.async = true;
+        document.body.appendChild(script);
+      }
     }
   }, []);
 
   const copyInviteLink = () => {
+    if (typeof window === 'undefined') return;
     const inviteUrl = `${window.location.origin}${window.location.pathname}?salon=${roomId}`;
     const textArea = document.createElement("textarea");
     textArea.value = inviteUrl;
@@ -157,7 +160,7 @@ export default function App() {
       setErrorMessage('Veuillez entrer un pseudo.');
       return;
     }
-    const PeerClass = window.Peer;
+    const PeerClass = typeof window !== 'undefined' ? window.Peer : null;
     if (!PeerClass) {
       setErrorMessage('Réseau P2P en chargement, réessayez dans un instant.');
       return;
@@ -224,7 +227,7 @@ export default function App() {
       setErrorMessage('Veuillez renseigner votre pseudo et le code du salon.');
       return;
     }
-    const PeerClass = window.Peer;
+    const PeerClass = typeof window !== 'undefined' ? window.Peer : null;
     if (!PeerClass) {
       setErrorMessage('Réseau P2P en chargement, réessayez dans un instant.');
       return;
