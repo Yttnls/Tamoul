@@ -135,6 +135,7 @@
             type="text"
             id="inputRoomCode"
             placeholder="CODE SALON"
+            onkeydown="if(event.key === 'Enter') handleJoinRoomClick()"
             class="w-full bg-slate-950 border border-slate-700 px-4 py-3 text-white uppercase font-mono tracking-widest text-center focus:outline-none focus:border-amber-400"
           />
           <button
@@ -374,8 +375,12 @@
     async function handleJoinRoomClick() {
       myName = document.getElementById('inputPlayerName').value.trim();
       const code = document.getElementById('inputRoomCode').value.trim().toUpperCase();
-      if (!myName || !code) {
-        showErrorMessage('Remplissez tous les champs.');
+      if (!myName) {
+        showErrorMessage('Veuillez entrer votre pseudo.');
+        return;
+      }
+      if (!code) {
+        showErrorMessage('Veuillez saisir le code du salon.');
         return;
       }
 
