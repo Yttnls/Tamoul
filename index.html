@@ -1,651 +1,851 @@
-<!DOCTYPE html>
-<html lang="fr">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Jeu de cartes Tamoul Multijoueur</title>
+import React, { useState, useEffect, useRef } from 'react';
+
+const SUITS = ['♠', '♣', '♥', '♦'];
+const VALUES = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'V', 'D', 'R'];
+
+const createDeck = () => {
+  const deck = [];
+  let id = 1;
+  SUITS.forEach(suit => {
+    const isRed = suit === '♥' || suit === '♦';
+    VALUES.forEach((val, idx) => {
+      let numericValue = idx + 1;
+      let isPower = false;
+      let powerType = null;
+      if (val === 'V' || val === 'D' || val === 'R') {
+        if (isRed) {
+          if (val === 'R') numericValue = 0;
+          else if (val === 'D') { numericValue = 10; isPower = true; powerType = 'PEEK_OWN'; }
+          else if (val === 'V') { numericValue = 10; isPower = true; powerType = 'SWAP'; }
+        } else {
+          numericValue = 10;
+        }
+      }
+      deck.push({ id: `card_${id++}`, suit, val, isRed, numericValue, isPower, powerType });
+    });
+  });
+  deck.push({ id: `card_${id++}`, suit: '🃏', val: 'JOKER', isRed: true, numericValue: 0, isPower: false });
+  deck.push({ id: `card_${id++}`, suit: '🃏', val: 'JOKER', isRed: false, numericValue: 0, isPower: false });
   
-  <!-- Tailwind CSS CDN avec Fallback de secours -->
-  <script src="https://cdn.tailwindcss.com"></script>
+  for (let i = deck.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [deck[i], deck[j]] = [deck[j], deck[i]];
+  }
+  return deck;
+};
 
-  <style>
-    body {
-      margin: 0;
-      padding: 0;
-      background-color: #020617;
-      color: #ffffff;
-      font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+const calculateScore = (cards) => {
+  return cards.reduce((acc, cObj) => {
+    const card = cObj.card;
+    if (card.val === 'JOKER') return acc + 0;
+    if (card.isRed && card.val === 'R') return acc + 0;
+    if (card.isRed && (card.val === 'D' || card.val === 'V')) return acc + 10;
+    return acc + card.numericValue;
+  }, 0);
+};
+
+const playCardSound = (type = 'draw') => {
+  try {
+    const AudioContext = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContext) return;
+    const ctx = new AudioContext();
+    if (ctx.state === 'suspended') ctx.resume();
+
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+
+    if (type === 'draw') {
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(320, ctx.currentTime);
+      osc.frequency.exponentialRampToValueAtTime(120, ctx.currentTime + 0.08);
+      gain.gain.setValueAtTime(0.2, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.08);
+    } else if (type === 'swap') {
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(440, ctx.currentTime);
+      osc.frequency.exponentialRampToValueAtTime(220, ctx.currentTime + 0.1);
+      gain.gain.setValueAtTime(0.25, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.1);
+    } else if (type === 'cut') {
+      osc.type = 'square';
+      osc.frequency.setValueAtTime(180, ctx.currentTime);
+      osc.frequency.exponentialRampToValueAtTime(80, ctx.currentTime + 0.07);
+      gain.gain.setValueAtTime(0.15, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.07);
+    } else {
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(260, ctx.currentTime);
+      osc.frequency.exponentialRampToValueAtTime(90, ctx.currentTime + 0.08);
+      gain.gain.setValueAtTime(0.2, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.08);
     }
-    .bg-apocalyptic {
-      background: radial-gradient(circle at 50% 90%, #ea580c 0%, #991b1b 25%, #3f1212 55%, #090d16 85%, #020617 100%);
-      background-attachment: fixed;
+
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + 0.1);
+  } catch (e) {}
+};
+
+export default function App() {
+  const [userId] = useState(() => 'usr_' + Math.random().toString(36).substring(2, 7));
+  const [playerName, setPlayerName] = useState('');
+  const [roomId, setRoomId] = useState('');
+  const [inRoom, setInRoom] = useState(false);
+  const [roomData, setRoomData] = useState(null);
+  const [errorMessage, setErrorMessage] = useState('');
+  const [copyFeedback, setCopyFeedback] = useState(false);
+
+  const [showIntroRules, setShowIntroRules] = useState(true);
+  const [showGameRulesModal, setShowGameRulesModal] = useState(false);
+  const [penaltyModal, setPenaltyModal] = useState(null);
+  const [peekModalCard, setPeekModalCard] = useState(null);
+  const [activePower, setActivePower] = useState(null);
+  const [swapMyCardIndex, setSwapMyCardIndex] = useState(null);
+  const [selectedPeekCards, setSelectedPeekCards] = useState([]);
+
+  const peerRef = useRef(null);
+  const connRef = useRef(null);
+  const hostConnsRef = useRef({});
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const salonParam = params.get('salon');
+    if (salonParam) {
+      setRoomId(salonParam.toUpperCase());
     }
-    .card-clean-back {
-      background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
-      border: 2px solid #64748b;
-      border-radius: 6px;
-      box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+
+    if (!window.Peer) {
+      const script = document.createElement('script');
+      script.src = 'https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js';
+      script.async = true;
+      document.body.appendChild(script);
     }
-    .card-clean-front {
-      background: #ffffff;
-      border: 2px solid #94a3b8;
-      border-radius: 6px;
-      box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+  }, []);
+
+  const copyInviteLink = () => {
+    const inviteUrl = `${window.location.origin}${window.location.pathname}?salon=${roomId}`;
+    const textArea = document.createElement("textarea");
+    textArea.value = inviteUrl;
+    textArea.style.position = "fixed";
+    document.body.appendChild(textArea);
+    textArea.focus();
+    textArea.select();
+    try {
+      document.execCommand('copy');
+      setCopyFeedback(true);
+      setTimeout(() => setCopyFeedback(false), 3000);
+    } catch (err) {}
+    document.body.removeChild(textArea);
+  };
+
+  const broadcastState = (newState) => {
+    setRoomData(newState);
+    if (peerRef.current && newState.hostId === userId) {
+      Object.values(hostConnsRef.current).forEach(c => {
+        if (c && c.open) {
+          c.send({ type: 'UPDATE_STATE', roomData: newState });
+        }
+      });
+    } else if (connRef.current && connRef.current.open) {
+      connRef.current.send({ type: 'UPDATE_STATE', roomData: newState });
     }
-  </style>
-</head>
-<body class="bg-apocalyptic text-white font-sans select-none min-h-screen flex flex-col">
+  };
 
-  <!-- Modal Règles Intro -->
-  <div id="introRulesModal" class="fixed inset-0 bg-black/90 z-50 flex items-center justify-center p-4">
-    <div class="bg-slate-900 border border-slate-700 p-6 sm:p-8 max-w-lg w-full flex flex-col items-center shadow-2xl rounded-lg">
-      <h2 class="text-2xl font-black text-amber-400 mb-4">📖 Bienvenue dans le jeu TAMOUL</h2>
-      <div class="space-y-4 text-sm text-slate-300 leading-relaxed text-left max-h-[60vh] overflow-y-auto pr-2">
-        <div class="bg-amber-500/10 border-l-4 border-amber-500 p-3 text-amber-200">
-          🎯 <strong>Objectif :</strong> Avoir le score le plus faible possible ou se débarrasser de ses cartes lorsque le "TAMOUL" est annoncé.
-        </div>
-        <div>
-          <h4 class="font-bold text-white mb-1">1. Déroulement d'un tour</h4>
-          <p>À votre tour, vous piochez une carte. Vous pouvez soit l'échanger avec l'une de vos 4 cartes cachées, soit défausser directement la carte piochée.</p>
-        </div>
-        <div>
-          <h4 class="font-bold text-white mb-1">2. Valeurs des Cartes</h4>
-          <ul class="list-disc pl-5 space-y-1 text-xs sm:text-sm">
-            <li><strong>1 à 10 :</strong> Valeur nominale.</li>
-            <li><strong>Figures Noires (♠/♣) :</strong> 10 points.</li>
-            <li><strong>Jokers & Rois Rouges (♥/♦) :</strong> <span class="text-emerald-400 font-bold">0 point</span>.</li>
-            <li><strong>Dames et Valets Rouges (♥/♦) en main :</strong> 10 points de pénalité.</li>
-          </ul>
-        </div>
-      </div>
-      <button 
-        onclick="document.getElementById('introRulesModal').style.display='none'"
-        class="mt-6 w-full bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold py-3 transition shadow-lg uppercase tracking-wider cursor-pointer rounded"
-      >
-        OK, c'est compris ! Let's go
-      </button>
-    </div>
-  </div>
+  const handleCreateRoom = () => {
+    if (!playerName.trim()) {
+      setErrorMessage('Veuillez entrer un pseudo.');
+      return;
+    }
+    const PeerClass = window.Peer;
+    if (!PeerClass) {
+      setErrorMessage('Réseau P2P en chargement, réessayez dans un instant.');
+      return;
+    }
+    const code = Math.random().toString(36).substring(2, 8).toUpperCase();
+    const peerId = `tamoul_room_${code}`;
 
-  <!-- Header -->
-  <header class="bg-slate-900 border-b border-slate-800 px-4 py-3 flex justify-between items-center shadow-md">
-    <h1 class="font-black text-amber-400 tracking-wider text-lg">TAMOUL <span id="headerRoomCode" class="text-xs text-slate-400"></span></h1>
-    <div class="flex items-center gap-3">
-      <button 
-        onclick="document.getElementById('rulesModal').style.display='flex'"
-        class="bg-slate-800 hover:bg-slate-700 text-amber-400 text-xs font-bold px-3 py-1.5 border border-slate-700 transition cursor-pointer rounded"
-      >
-        📖 Règles & Valeurs
-      </button>
-    </div>
-  </header>
+    if (peerRef.current) peerRef.current.destroy();
 
-  <!-- Modal Règles Permanent -->
-  <div id="rulesModal" class="fixed inset-0 bg-black/85 z-50 hidden items-center justify-center p-4">
-    <div class="bg-slate-900 border border-slate-700 p-6 max-w-lg w-full flex flex-col items-center shadow-2xl rounded-lg">
-      <h3 class="text-xl font-bold text-amber-400 mb-4">📖 Règles & Valeurs des cartes</h3>
-      <div class="space-y-4 text-sm text-slate-300 leading-relaxed text-left max-h-[65vh] overflow-y-auto pr-2">
-        <div class="bg-amber-500/10 border-l-4 border-amber-500 p-3 text-amber-200">
-          🎯 <strong>Objectif :</strong> Avoir le score le plus faible possible.
-        </div>
-        <div>
-          <h4 class="font-bold text-white mb-1">Valeurs</h4>
-          <p>Rois rouges & Jokers = 0 pts | Chiffres = valeur nominale | Figures = 10 pts.</p>
-        </div>
-      </div>
-      <button 
-        onclick="document.getElementById('rulesModal').style.display='none'"
-        class="mt-6 w-full bg-slate-800 hover:bg-slate-700 text-white font-bold py-2.5 transition border border-slate-600 cursor-pointer rounded"
-      >
-        Fermer
-      </button>
-    </div>
-  </div>
+    try {
+      const peer = new PeerClass(peerId, { debug: 1 });
+      peerRef.current = peer;
 
-  <!-- Contenu Principal -->
-  <main class="flex-1 flex flex-col items-center justify-center p-4">
+      peer.on('open', () => {
+        const initial = {
+          roomId: code,
+          hostId: userId,
+          gameState: 'LOBBY',
+          players: { [userId]: { id: userId, name: playerName.trim(), cards: [], hasPeeked: false, score: 0 } },
+          playerOrder: [userId],
+          currentTurnIndex: 0,
+          deck: [],
+          discardPile: [],
+          drawnCard: null,
+          tamoulCalledBy: null,
+          lastAction: `${playerName.trim()} a créé le salon (${code}).`
+        };
+        setRoomId(code);
+        setRoomData(initial);
+        setInRoom(true);
+        setErrorMessage('');
+      });
+
+      peer.on('error', (err) => {
+        setErrorMessage(`Erreur réseau P2P: ${err.type || 'Salon en cours'}`);
+      });
+
+      peer.on('connection', (conn) => {
+        hostConnsRef.current[conn.peer] = conn;
+
+        conn.on('data', (data) => {
+          if (data.type === 'JOIN_REQUEST') {
+            const newPlayer = data.player;
+            setRoomData(prev => {
+              if (!prev) return prev;
+              const updatedPlayers = { ...prev.players, [newPlayer.id]: newPlayer };
+              const updatedOrder = prev.playerOrder.includes(newPlayer.id) ? prev.playerOrder : [...prev.playerOrder, newPlayer.id];
+              const updatedState = { ...prev, players: updatedPlayers, playerOrder: updatedOrder, lastAction: `${newPlayer.name} a rejoint le salon.` };
+              broadcastState(updatedState);
+              return updatedState;
+            });
+          } else if (data.type === 'UPDATE_STATE') {
+            broadcastState(data.roomData);
+          }
+        });
+      });
+    } catch (err) {
+      setErrorMessage('Erreur lors de la création du salon.');
+    }
+  };
+
+  const handleJoinRoom = () => {
+    if (!playerName.trim() || !roomId.trim()) {
+      setErrorMessage('Veuillez renseigner votre pseudo et le code du salon.');
+      return;
+    }
+    const PeerClass = window.Peer;
+    if (!PeerClass) {
+      setErrorMessage('Réseau P2P en chargement, réessayez dans un instant.');
+      return;
+    }
+    const code = roomId.trim().toUpperCase();
+
+    if (peerRef.current) peerRef.current.destroy();
+
+    try {
+      const peer = new PeerClass({ debug: 1 });
+      peerRef.current = peer;
+
+      peer.on('open', () => {
+        const conn = peer.connect(`tamoul_room_${code}`);
+        connRef.current = conn;
+
+        conn.on('open', () => {
+          const newPlayerObj = { id: userId, name: playerName.trim(), cards: [], hasPeeked: false, score: 0 };
+          conn.send({ type: 'JOIN_REQUEST', player: newPlayerObj });
+          setRoomId(code);
+          setInRoom(true);
+          setErrorMessage('');
+        });
+
+        conn.on('error', () => {
+          setErrorMessage('Salon introuvable. Assurez-vous que l\'hôte a bien créé le salon.');
+        });
+      });
+
+      peer.on('error', () => {
+        setErrorMessage('Connexion impossible. Vérifiez le code salon.');
+      });
+    } catch (err) {
+      setErrorMessage('Erreur lors de la connexion au salon.');
+    }
+  };
+
+  const handleStartGame = () => {
+    const deck = createDeck();
+    const players = { ...roomData.players };
+    roomData.playerOrder.forEach(id => {
+      players[id].cards = deck.splice(0, 4).map(c => ({ card: c, isFaceUp: false }));
+      players[id].hasPeeked = false;
+    });
+    const initialDiscard = [deck.pop()];
+    const newState = {
+      ...roomData,
+      gameState: 'PEEKING',
+      deck,
+      discardPile: initialDiscard,
+      players,
+      currentTurnIndex: 0,
+      tamoulCalledBy: null,
+      lastAction: "Partie lancée ! Choisissez 2 cartes à mémoriser."
+    };
+    broadcastState(newState);
+  };
+
+  const handleFinishPeeking = () => {
+    const myPlayer = roomData.players[userId];
+    const updatedCards = myPlayer.cards.map((c) => ({ ...c, isFaceUp: false }));
+
+    const updatedPlayers = {
+      ...roomData.players,
+      [userId]: { ...myPlayer, cards: updatedCards, hasPeeked: true }
+    };
+
+    const allPeeked = roomData.playerOrder.every(id => updatedPlayers[id].hasPeeked);
+    const newState = {
+      ...roomData,
+      players: updatedPlayers,
+      gameState: allPeeked ? 'PLAYING' : 'PEEKING',
+      lastAction: allPeeked ? "C'est parti ! Le premier joueur peut jouer." : `${myPlayer.name} a mémorisé ses cartes.`
+    };
+    setSelectedPeekCards([]);
+    broadcastState(newState);
+  };
+
+  const handleDrawFromDeck = () => {
+    if (!roomData || roomData.drawnCard) return;
+    playCardSound('draw');
+    let deck = [...roomData.deck];
+    let discard = [...roomData.discardPile];
+
+    if (deck.length === 0 && discard.length > 1) {
+      const top = discard.pop();
+      deck = [...discard];
+      discard = [top];
+    }
+
+    const drawnCard = deck.pop();
+    const newState = {
+      ...roomData,
+      deck,
+      discardPile: discard,
+      drawnCard,
+      lastAction: `${roomData.players[userId].name} a pioché une carte.`
+    };
+    broadcastState(newState);
+  };
+
+  const nextTurn = (state = roomData) => {
+    const nextIndex = (state.currentTurnIndex + 1) % state.playerOrder.length;
+    const nextPlayerId = state.playerOrder[nextIndex];
+
+    if (state.tamoulCalledBy === nextPlayerId) {
+      const finalPlayers = { ...state.players };
+      Object.keys(finalPlayers).forEach(pId => {
+        finalPlayers[pId].score = calculateScore(finalPlayers[pId].cards);
+      });
+      const endState = {
+        ...state,
+        players: finalPlayers,
+        gameState: 'GAME_OVER',
+        lastAction: "La partie est terminée ! Affichage des résultats."
+      };
+      broadcastState(endState);
+      return;
+    }
+
+    const newState = {
+      ...state,
+      currentTurnIndex: nextIndex,
+      lastAction: `Tour à ${state.players[nextPlayerId]?.name}`
+    };
+    broadcastState(newState);
+  };
+
+  const handleSwapDrawnWithHand = (idx) => {
+    playCardSound('swap');
+    const myHand = [...roomData.players[userId].cards];
+    const oldCardObj = myHand[idx];
+    myHand[idx] = { card: roomData.drawnCard, isFaceUp: false };
+    const newDiscard = [...roomData.discardPile, oldCardObj.card];
     
-    <!-- Écran Accueil -->
-    <div id="screenHome" class="w-full max-w-md bg-slate-900/90 border border-slate-700 p-6 sm:p-8 shadow-2xl flex flex-col items-center rounded-lg">
-      <h2 class="text-3xl font-black text-amber-400 tracking-wider mb-2">TAMOUL</h2>
-      <p class="text-xs text-slate-400 mb-6">Jeu de cartes multijoueur en ligne</p>
-
-      <div id="errorMessage" class="w-full bg-red-600/30 border border-red-500 text-red-200 text-xs p-3 mb-4 hidden rounded"></div>
-
-      <div class="w-full space-y-4">
-        <div>
-          <label class="block text-xs font-bold uppercase text-slate-400 mb-1">Votre Pseudo</label>
-          <input
-            type="text"
-            id="inputPlayerName"
-            maxLength="15"
-            placeholder="Ex: Alex"
-            class="w-full bg-slate-950 border border-slate-700 px-4 py-3 text-white focus:outline-none focus:border-amber-400 rounded"
-          />
-        </div>
-
-        <button
-          onclick="handleCreateRoomClick()"
-          class="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-3 transition shadow cursor-pointer rounded"
-        >
-          Créer un nouveau salon
-        </button>
-
-        <div class="relative flex py-2 items-center">
-          <div class="flex-grow border-t border-slate-700"></div>
-          <span class="flex-shrink mx-4 text-xs text-slate-500 uppercase">OU</span>
-          <div class="flex-grow border-t border-slate-700"></div>
-        </div>
-
-        <div class="flex gap-2">
-          <input
-            type="text"
-            id="inputRoomCode"
-            placeholder="CODE SALON"
-            onkeydown="if(event.key === 'Enter') handleJoinRoomClick()"
-            class="w-full bg-slate-950 border border-slate-700 px-4 py-3 text-white uppercase font-mono tracking-widest text-center focus:outline-none focus:border-amber-400 rounded"
-          />
-          <button
-            id="btnJoinRoom"
-            onclick="handleJoinRoomClick()"
-            class="bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold px-6 py-3 transition shadow cursor-pointer rounded"
-          >
-            Entrer
-          </button>
-        </div>
-      </div>
-    </div>
-
-    <!-- Écran Lobby -->
-    <div id="screenLobby" class="w-full max-w-lg bg-slate-900/90 border border-slate-700 p-6 sm:p-8 shadow-2xl hidden flex-col items-center rounded-lg">
-      <h2 class="text-xl font-bold text-amber-400 mb-4">Salon d'attente</h2>
-      
-      <div class="bg-slate-950 border border-slate-700 p-4 mb-4 text-center w-full rounded">
-        <p class="text-xs text-slate-400 mb-1">Code du salon à partager :</p>
-        <span id="displayRoomCode" class="text-3xl font-black tracking-widest text-amber-400 font-mono"></span>
-      </div>
-
-      <div class="w-full mb-6">
-        <button
-          onclick="copyInviteLink()"
-          class="w-full bg-blue-600 hover:bg-blue-500 text-white font-bold py-2.5 text-xs uppercase tracking-wider transition flex items-center justify-center gap-2 cursor-pointer shadow rounded"
-        >
-          📋 Copier le lien d'invitation direct
-        </button>
-        <p id="copyFeedback" class="text-center text-[10px] text-emerald-400 mt-1 hidden">Lien copié dans le presse-papier !</p>
-      </div>
-
-      <div class="w-full mb-6 space-y-2">
-        <p class="text-xs font-bold uppercase text-slate-400">Joueurs connectés</p>
-        <div id="playersList" class="space-y-2"></div>
-      </div>
-
-      <div id="hostControls" class="w-full hidden">
-        <button
-          onclick="startGame()"
-          class="w-full py-3 font-bold uppercase tracking-wider transition bg-emerald-600 hover:bg-emerald-500 text-white cursor-pointer shadow rounded"
-        >
-          Lancer la partie
-        </button>
-      </div>
-      <div id="guestWaiting" class="w-full text-center text-sm text-slate-400 italic">
-        En attente que l'hôte lance la partie...
-      </div>
-    </div>
-
-    <!-- Écran Jeu -->
-    <div id="screenGame" class="w-full max-w-5xl hidden flex-col items-center justify-between">
-      <div id="opponentsArea" class="flex flex-wrap justify-center gap-4 my-2 w-full"></div>
-
-      <div id="gameCenter" class="my-6 flex items-center gap-6">
-        <div class="flex flex-col items-center">
-          <span id="deckCount" class="text-[10px] uppercase text-slate-400 mb-1">Pioche (0)</span>
-          <div onclick="drawCard()" class="card-clean-back w-16 h-24 sm:w-20 sm:h-28 flex items-center justify-center cursor-pointer hover:scale-105 transition">
-            <span class="text-slate-500 font-bold">🎴</span>
-          </div>
-        </div>
-
-        <div class="flex flex-col items-center">
-          <span class="text-[10px] uppercase text-slate-400 mb-1">Défausse</span>
-          <div id="discardCardContainer"></div>
-        </div>
-
-        <div id="drawnCardContainer" class="hidden flex-col items-center">
-          <span class="text-[10px] uppercase text-amber-400 mb-1">Piochée</span>
-          <div id="drawnCardView"></div>
-          <button onclick="discardDrawn()" class="mt-2 bg-red-600 hover:bg-red-500 text-white text-xs font-bold px-2 py-1 cursor-pointer rounded">Défausser</button>
-        </div>
-      </div>
-
-      <!-- Main du joueur -->
-      <div class="w-full max-w-md bg-slate-900/95 border border-slate-700 p-4 flex flex-col items-center shadow-2xl rounded-lg">
-        <div class="w-full flex justify-between items-center mb-3">
-          <span class="text-xs font-bold text-amber-400 uppercase">Vos cartes (2x2)</span>
-          <button onclick="callTamoul()" class="bg-red-600 hover:bg-red-500 text-white font-black text-xs px-3 py-1 shadow cursor-pointer rounded">🔔 TAMOUL</button>
-        </div>
-
-        <div id="myHandGrid" class="grid grid-cols-2 gap-3 my-2"></div>
-
-        <div id="peekingActionArea" class="mt-3 hidden">
-          <button id="btnFinishPeeking" onclick="finishPeeking()" disabled class="bg-slate-800 text-slate-600 px-6 py-2 text-xs font-bold uppercase cursor-not-allowed rounded">
-            Mémoriser (Sélectionnez 2 cartes)
-          </button>
-        </div>
-      </div>
-    </div>
-
-  </main>
-
-  <script>
-    let myName = '';
-    let roomCode = '';
-    let myUserId = localStorage.getItem('tamoul_uid') || ('usr_' + Math.random().toString(36).substring(2, 7));
-    localStorage.setItem('tamoul_uid', myUserId);
-
-    let gameState = {
-      phase: 'LOBBY',
-      hostId: '',
-      players: {},
-      playerOrder: [],
-      turnIndex: 0,
-      deck: [],
-      discardPile: [],
+    const updatedState = {
+      ...roomData,
+      players: { ...roomData.players, [userId]: { ...roomData.players[userId], cards: myHand } },
+      discardPile: newDiscard,
       drawnCard: null
     };
 
-    let selectedPeek = [];
-    let isHost = false;
-    let peer = null;
-    let connections = {};
-    let hostConn = null;
-
-    // Chargement dynamique de PeerJS pour une connexion P2P directe sans clé d'API
-    (function loadPeerJS() {
-      const script = document.createElement('script');
-      script.src = 'https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js';
-      document.body.appendChild(script);
-    })();
-
-    function initPeer(id, callback) {
-      if (!window.Peer) {
-        setTimeout(() => initPeer(id, callback), 200);
-        return;
-      }
-      if (peer) peer.destroy();
-      peer = new window.Peer(id, { debug: 1 });
-      peer.on('open', callback);
-      peer.on('error', (err) => {
-        showErrorMessage('Erreur réseau ou salon introuvable.');
-      });
+    if (oldCardObj.card.isPower) {
+      triggerPower(oldCardObj.card, updatedState);
+    } else {
+      nextTurn(updatedState);
     }
+  };
 
-    function setupHostServer() {
-      peer.on('connection', (conn) => {
-        connections[conn.peer] = conn;
-        conn.on('data', (data) => {
-          if (data.type === 'JOIN') {
-            gameState.players[data.player.id] = data.player;
-            if (!gameState.playerOrder.includes(data.player.id)) {
-              gameState.playerOrder.push(data.player.id);
-            }
-            saveAndSync();
-          } else if (data.type === 'ACTION') {
-            gameState = data.state;
-            saveAndSync();
-          }
-        });
-      });
+  const handleDiscardDrawn = () => {
+    playCardSound('discard');
+    const discarded = roomData.drawnCard;
+    const newDiscard = [...roomData.discardPile, discarded];
+    const updatedState = { ...roomData, discardPile: newDiscard, drawnCard: null };
+
+    if (discarded.isPower) {
+      triggerPower(discarded, updatedState);
+    } else {
+      nextTurn(updatedState);
     }
+  };
 
-    function window_copyInviteLink() {
-      const inviteUrl = `${window.location.origin}${window.location.pathname}?salon=${roomCode}`;
-      const textArea = document.createElement("textarea");
-      textArea.value = inviteUrl;
-      textArea.style.position = "fixed";
-      document.body.appendChild(textArea);
-      textArea.focus();
-      textArea.select();
-      try {
-        document.execCommand('copy');
-        const feedback = document.getElementById('copyFeedback');
-        feedback.classList.remove('hidden');
-        setTimeout(() => feedback.classList.add('hidden'), 3000);
-      } catch (err) {}
-      document.body.removeChild(textArea);
+  const triggerPower = (card, state) => {
+    if (card.powerType === 'PEEK_OWN') {
+      setActivePower('PEEK_OWN');
+      broadcastState({ ...state, lastAction: `${roomData.players[userId].name} a activé la Dame Rouge !` });
+    } else if (card.powerType === 'SWAP') {
+      setActivePower('SWAP_SELECT_MY_CARD');
+      broadcastState({ ...state, lastAction: `${roomData.players[userId].name} a activé le Valet Rouge !` });
+    } else {
+      nextTurn(state);
     }
-    window.copyInviteLink = window_copyInviteLink;
+  };
 
-    function showErrorMessage(msg) {
-      const el = document.getElementById('errorMessage');
-      el.textContent = msg;
-      el.classList.remove('hidden');
-    }
+  const skipPower = () => {
+    setActivePower(null);
+    setSwapMyCardIndex(null);
+    nextTurn();
+  };
 
-    function createDeck() {
-      const suits = ['♠', '♣', '♥', '♦'];
-      const values = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'V', 'D', 'R'];
-      let deck = [];
-      let id = 1;
-      suits.forEach(suit => {
-        const isRed = suit === '♥' || suit === '♦';
-        values.forEach((val, idx) => {
-          let num = idx + 1;
-          if (val === 'V' || val === 'D' || val === 'R') num = 10;
-          deck.push({ id: `c_${id++}`, suit, val, isRed, num });
-        });
-      });
-      deck.push({ id: `c_${id++}`, suit: '🃏', val: 'JOKER', isRed: true, num: 0 });
-      deck.push({ id: `c_${id++}`, suit: '🃏', val: 'JOKER', isRed: false, num: 0 });
+  const handleCardClickWithPower = (idx, targetPlayerId = null) => {
+    if (activePower === 'PEEK_OWN') {
+      const cardObj = roomData.players[userId].cards[idx];
+      setPeekModalCard(cardObj.card);
+      setActivePower(null);
+      nextTurn();
+    } else if (activePower === 'SWAP_SELECT_MY_CARD') {
+      setSwapMyCardIndex(idx);
+      setActivePower('SWAP_SELECT_TARGET_CARD');
+    } else if (activePower === 'SWAP_SELECT_TARGET_CARD' && targetPlayerId && targetPlayerId !== userId) {
+      const myHand = [...roomData.players[userId].cards];
+      const targetHand = [...roomData.players[targetPlayerId].cards];
 
-      for (let i = deck.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [deck[i], deck[j]] = [deck[j], deck[i]];
-      }
-      return deck;
-    }
+      const myCardObj = myHand[swapMyCardIndex];
+      const targetCardObj = targetHand[idx];
 
-    function playCardSound() {
-      try {
-        const ctx = new (window.AudioContext || window.webkitAudioContext)();
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.frequency.setValueAtTime(300, ctx.currentTime);
-        osc.frequency.exponentialRampToValueAtTime(100, ctx.currentTime + 0.08);
-        gain.gain.setValueAtTime(0.15, ctx.currentTime);
-        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.08);
-        osc.connect(gain);
-        gain.connect(ctx.destination);
-        osc.start();
-        osc.stop(ctx.currentTime + 0.08);
-      } catch(e) {}
-    }
+      myHand[swapMyCardIndex] = targetCardObj;
+      targetHand[idx] = myCardObj;
 
-    function saveAndSync() {
-      updateUI();
-      if (isHost) {
-        Object.values(connections).forEach(conn => {
-          if (conn.open) conn.send({ type: 'SYNC', state: gameState });
-        });
-      } else if (hostConn && hostConn.open) {
-        hostConn.send({ type: 'ACTION', state: gameState });
-      }
-    }
-
-    function handleCreateRoomClick() {
-      myName = document.getElementById('inputPlayerName').value.trim();
-      if (!myName) {
-        showErrorMessage('Veuillez entrer un pseudo.');
-        return;
-      }
-      roomCode = Math.random().toString(36).substring(2, 8).toUpperCase();
-      isHost = true;
-
-      gameState = {
-        phase: 'LOBBY',
-        hostId: myUserId,
-        players: {
-          [myUserId]: { id: myUserId, name: myName, cards: [], hasPeeked: false, score: 0 }
-        },
-        playerOrder: [myUserId],
-        turnIndex: 0,
-        deck: [],
-        discardPile: [],
-        drawnCard: null
+      const updatedPlayers = {
+        ...roomData.players,
+        [userId]: { ...roomData.players[userId], cards: myHand },
+        [targetPlayerId]: { ...roomData.players[targetPlayerId], cards: targetHand }
       };
 
-      initPeer(`tamoul_room_${roomCode}`, () => {
-        setupHostServer();
-        document.getElementById('screenHome').style.display = 'none';
-        document.getElementById('displayRoomCode').textContent = roomCode;
-        document.getElementById('headerRoomCode').textContent = `(${roomCode})`;
-        updateUI();
-      });
+      const newState = {
+        ...roomData,
+        players: updatedPlayers,
+        lastAction: `Échange réussi avec le Valet Rouge !`
+      };
+
+      setPeekModalCard(targetCardObj.card);
+      setActivePower(null);
+      setSwapMyCardIndex(null);
+      nextTurn(newState);
     }
+  };
 
-    function handleJoinRoomClick() {
-      myName = document.getElementById('inputPlayerName').value.trim();
-      const code = document.getElementById('inputRoomCode').value.trim().toUpperCase();
-      if (!myName || !code) {
-        showErrorMessage('Veuillez saisir votre pseudo et le code du salon.');
-        return;
-      }
+  const handleReflexCut = (idx) => {
+    playCardSound('cut');
+    const topDiscard = roomData.discardPile[roomData.discardPile.length - 1];
+    const myHand = [...roomData.players[userId].cards];
+    const playedCardObj = myHand[idx];
 
-      roomCode = code;
-      isHost = false;
-      const peerId = `usr_${Math.random().toString(36).substring(2, 7)}`;
+    if (playedCardObj.card.val === topDiscard.val) {
+      myHand.splice(idx, 1);
+      const newState = {
+        ...roomData,
+        players: { ...roomData.players, [userId]: { ...roomData.players[userId], cards: myHand } },
+        discardPile: [...roomData.discardPile, playedCardObj.card],
+        lastAction: `⚡ RÉFLEXE ! ${roomData.players[userId].name} a coupé une carte !`
+      };
+      broadcastState(newState);
+    } else {
+      let deck = [...roomData.deck];
+      let penalty = deck.length > 0 ? deck.pop() : null;
+      myHand[idx].isFaceUp = true;
+      if (penalty) myHand.push({ card: penalty, isFaceUp: false });
 
-      initPeer(peerId, () => {
-        hostConn = peer.connect(`tamoul_room_${roomCode}`);
-        hostConn.on('open', () => {
-          const playerObj = { id: myUserId, name: myName, cards: [], hasPeeked: false, score: 0 };
-          hostConn.send({ type: 'JOIN', player: playerObj });
-
-          document.getElementById('screenHome').style.display = 'none';
-          document.getElementById('displayRoomCode').textContent = roomCode;
-          document.getElementById('headerRoomCode').textContent = `(${roomCode})`;
-        });
-
-        hostConn.on('data', (data) => {
-          if (data.type === 'SYNC') {
-            gameState = data.state;
-            updateUI();
-          }
-        });
-      });
+      const newState = {
+        ...roomData,
+        deck,
+        players: { ...roomData.players, [userId]: { ...roomData.players[userId], cards: myHand } },
+        lastAction: `❌ Mauvais réflexe de ${roomData.players[userId].name} (Pénalité) !`
+      };
+      broadcastState(newState);
+      if (penalty) setPenaltyModal(penalty);
     }
+  };
 
-    function updateUI() {
-      if (gameState.phase === 'LOBBY') {
-        document.getElementById('screenLobby').style.display = 'flex';
-        document.getElementById('screenGame').style.display = 'none';
-        renderLobby();
-      } else {
-        document.getElementById('screenLobby').style.display = 'none';
-        document.getElementById('screenGame').style.display = 'flex';
-        renderGame();
-      }
+  const handleCallTamoul = () => {
+    if (roomData.tamoulCalledBy !== null) return;
+    const newState = {
+      ...roomData,
+      tamoulCalledBy: userId,
+      lastAction: `🔔 TAMOUL annoncé par ${roomData.players[userId].name} ! Dernier tour.`
+    };
+    broadcastState(newState);
+  };
+
+  const renderCard = (card, isFaceUp = true, onClick = null, extraClasses = "") => {
+    if (!card) return <div className="w-16 h-24 sm:w-20 sm:h-28 border border-dashed border-slate-700" style={{ borderRadius: 0 }}></div>;
+    if (!isFaceUp) {
+      return (
+        <div onClick={onClick} className={`w-16 h-24 sm:w-20 sm:h-28 bg-slate-900 border-2 border-slate-600 flex items-center justify-center cursor-pointer shadow-lg transition relative select-none ${extraClasses}`} style={{ borderRadius: 0 }}>
+          <span className="text-xl text-slate-500 font-bold">🎴</span>
+        </div>
+      );
     }
+    const isRed = card.isRed;
+    const color = isRed ? 'text-red-600' : 'text-slate-900';
+    return (
+      <div onClick={onClick} className={`w-16 h-24 sm:w-20 sm:h-28 bg-white border-2 border-slate-400 flex flex-col justify-between p-2 cursor-pointer shadow-lg transition select-none relative ${color} ${extraClasses}`} style={{ borderRadius: 0 }}>
+        <div className="flex justify-between items-start leading-none">
+          <span className="font-bold text-sm sm:text-base">{card.val}</span>
+          <span className="text-xs">{card.suit}</span>
+        </div>
+        <div className="text-center text-xl sm:text-2xl font-black my-auto">{card.suit}</div>
+        <div className="flex justify-between items-end leading-none rotate-180">
+          <span className="font-bold text-sm sm:text-base">{card.val}</span>
+          <span className="text-xs">{card.suit}</span>
+        </div>
+        {card.isPower && (
+          <div className="absolute bottom-1 right-1 bg-amber-400 text-slate-950 text-[9px] font-bold px-1 border border-amber-600">
+            {card.val === 'D' ? '👁️' : '🔄'}
+          </div>
+        )}
+      </div>
+    );
+  };
 
-    function renderLobby() {
-      const list = document.getElementById('playersList');
-      list.innerHTML = '';
-      Object.values(gameState.players).forEach(p => {
-        const div = document.createElement('div');
-        div.className = 'bg-slate-950 border border-slate-800 px-4 py-3 flex justify-between items-center rounded';
-        div.innerHTML = `<span class="font-bold text-slate-200">${p.name} ${p.id === gameState.hostId ? '<span class="text-xs text-amber-400 font-normal">(Hôte)</span>' : ''}</span>`;
-        list.appendChild(div);
-      });
+  const RulesModalContent = () => (
+    <div className="space-y-4 text-sm text-slate-300 leading-relaxed text-left max-h-[65vh] overflow-y-auto pr-2">
+      <div className="bg-amber-500/10 border-l-4 border-amber-500 p-3 text-amber-200">
+        🎯 <strong>Objectif :</strong> Avoir le score le plus faible possible ou se débarrasser de ses cartes lorsque le "TAMOUL" est annoncé.
+      </div>
+      <div>
+        <h4 className="font-bold text-white mb-1">1. Déroulement d'un tour</h4>
+        <p>À votre tour, vous piochez une carte. Vous pouvez soit l'échanger avec l'une de vos cartes cachées, soit défausser directement la carte piochée.</p>
+      </div>
+      <div>
+        <h4 className="font-bold text-white mb-1">2. Valeurs des Cartes</h4>
+        <ul className="list-disc pl-5 space-y-1 text-xs sm:text-sm">
+          <li><strong>Cartes de 1 à 10 :</strong> Valeur nominale.</li>
+          <li><strong>Figures Noires (♠/♣) :</strong> 10 points.</li>
+          <li><strong>Jokers & Rois Rouges (♥/♦) :</strong> <span className="text-emerald-400 font-bold">0 point</span>.</li>
+          <li><strong>Dames et Valets Rouges (♥/♦) en main :</strong> 10 points de pénalité en fin de partie.</li>
+        </ul>
+      </div>
+      <div>
+        <h4 className="font-bold text-white mb-1">3. Pouvoirs Spéciaux</h4>
+        <ul className="list-disc pl-5 space-y-1 text-xs sm:text-sm">
+          <li><strong className="text-pink-400">Dame Rouge :</strong> Permet d'observer secrètement l'une de vos cartes.</li>
+          <li><strong className="text-blue-400">Valet Rouge :</strong> Permet d'échanger l'une de vos cartes avec celle d'un adversaire.</li>
+        </ul>
+      </div>
+    </div>
+  );
 
-      if (isHost || gameState.hostId === myUserId) {
-        document.getElementById('hostControls').style.display = 'block';
-        document.getElementById('guestWaiting').style.display = 'none';
-      } else {
-        document.getElementById('hostControls').style.display = 'none';
-        document.getElementById('guestWaiting').style.display = 'block';
-      }
-    }
-
-    function startGame() {
-      const deck = createDeck();
-      Object.values(gameState.players).forEach(p => {
-        p.cards = deck.splice(0, 4).map(c => ({ card: c, faceUp: false }));
-        p.hasPeeked = false;
-      });
-      gameState.deck = deck;
-      gameState.discardPile = [deck.pop()];
-      gameState.phase = 'PEEKING';
-      gameState.turnIndex = 0;
-
-      saveAndSync();
-    }
-
-    function renderCard(card, faceUp, onClickAttr = '') {
-      if (!card) return '<div class="w-16 h-24 border border-dashed border-slate-700 rounded"></div>';
-      if (!faceUp) {
-        return `<div ${onClickAttr} class="card-clean-back w-16 h-24 sm:w-20 sm:h-28 flex items-center justify-center cursor-pointer shadow-lg">
-          <span class="text-xl text-slate-500 font-bold">🎴</span>
-        </div>`;
-      }
-      const color = card.isRed ? 'text-red-600' : 'text-slate-900';
-      return `<div ${onClickAttr} class="card-clean-front w-16 h-24 sm:w-20 sm:h-28 flex flex-col justify-between p-2 cursor-pointer shadow-lg ${color}">
-        <div class="flex justify-between items-start leading-none"><span class="font-bold text-sm">${card.val}</span><span class="text-xs">${card.suit}</span></div>
-        <div class="text-center text-xl font-black my-auto">${card.suit}</div>
-        <div class="flex justify-between items-end leading-none rotate-180"><span class="font-bold text-sm">${card.val}</span><span class="text-xs">${card.suit}</span></div>
-      </div>`;
-    }
-
-    function renderGame() {
-      const oppArea = document.getElementById('opponentsArea');
-      oppArea.innerHTML = '';
+  return (
+    <div className="min-h-screen text-white flex flex-col font-sans select-none overflow-x-hidden" style={{ background: 'radial-gradient(circle at 50% 90%, #ea580c 0%, #991b1b 25%, #3f1212 55%, #090d16 85%, #020617 100%)', backgroundAttachment: 'fixed' }}>
       
-      gameState.playerOrder.forEach(pId => {
-        if (pId === myUserId) return;
-        const p = gameState.players[pId];
-        if (!p) return;
-        const isTurn = gameState.playerOrder[gameState.turnIndex] === pId;
-        const div = document.createElement('div');
-        div.className = `bg-slate-900/90 border ${isTurn ? 'border-amber-400' : 'border-slate-800'} p-3 flex flex-col items-center rounded-lg`;
-        
-        let cardsHtml = '<div class="grid grid-cols-2 gap-1.5">';
-        p.cards.forEach(cObj => {
-          cardsHtml += renderCard(cObj.card, gameState.phase === 'GAME_OVER' || cObj.faceUp);
-        });
-        cardsHtml += '</div>';
+      {showIntroRules && (
+        <div className="fixed inset-0 bg-black/90 z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-700 p-6 sm:p-8 max-w-lg w-full flex flex-col items-center shadow-2xl">
+            <h2 className="text-2xl font-black text-amber-400 mb-4">📖 Bienvenue dans le jeu TAMOUL</h2>
+            <RulesModalContent />
+            <button 
+              onClick={() => setShowIntroRules(false)}
+              className="mt-6 w-full bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold py-3 transition shadow-lg uppercase tracking-wider"
+            >
+              OK, c'est compris ! Let's go
+            </button>
+          </div>
+        </div>
+      )}
 
-        div.innerHTML = `<p class="text-xs font-bold text-slate-300 mb-2">${p.name} ${isTurn ? '⭐' : ''}</p>` + cardsHtml;
-        oppArea.appendChild(div);
-      });
+      {showGameRulesModal && (
+        <div className="fixed inset-0 bg-black/85 z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-700 p-6 max-w-lg w-full flex flex-col items-center shadow-2xl">
+            <h3 className="text-xl font-bold text-amber-400 mb-4">📖 Règles & Valeurs des cartes</h3>
+            <RulesModalContent />
+            <button 
+              onClick={() => setShowGameRulesModal(false)}
+              className="mt-6 w-full bg-slate-800 hover:bg-slate-700 text-white font-bold py-2.5 transition border border-slate-600"
+            >
+              Fermer
+            </button>
+          </div>
+        </div>
+      )}
 
-      document.getElementById('deckCount').textContent = `Pioche (${gameState.deck.length})`;
-      const topDiscard = gameState.discardPile[gameState.discardPile.length - 1];
-      document.getElementById('discardCardContainer').innerHTML = renderCard(topDiscard, true);
+      {peekModalCard && (
+        <div className="fixed inset-0 bg-black/85 z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-700 p-6 max-w-sm w-full text-center flex flex-col items-center">
+            <h3 className="text-lg font-bold text-amber-400 mb-4">Carte consultée</h3>
+            <div className="mb-6">{renderCard(peekModalCard, true)}</div>
+            <button onClick={() => setPeekModalCard(null)} className="w-full bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold py-2">OK</button>
+          </div>
+        </div>
+      )}
 
-      const drawnContainer = document.getElementById('drawnCardContainer');
-      if (gameState.drawnCard && gameState.playerOrder[gameState.turnIndex] === myUserId) {
-        drawnContainer.style.display = 'flex';
-        document.getElementById('drawnCardView').innerHTML = renderCard(gameState.drawnCard, true);
-      } else {
-        drawnContainer.style.display = 'none';
-      }
+      {penaltyModal && (
+        <div className="fixed inset-0 bg-black/85 z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-700 p-6 max-w-sm w-full text-center flex flex-col items-center">
+            <h3 className="text-lg font-bold text-red-400 mb-2">Pénalité de Réflexe !</h3>
+            <p className="text-xs text-slate-300 mb-4">La carte ne correspondait pas :</p>
+            <div className="mb-6">{renderCard(penaltyModal, true)}</div>
+            <button onClick={() => setPenaltyModal(null)} className="w-full bg-red-600 hover:bg-red-500 text-white font-bold py-2">Fermer</button>
+          </div>
+        </div>
+      )}
 
-      const myPlayer = gameState.players[myUserId];
-      const myHandGrid = document.getElementById('myHandGrid');
-      myHandGrid.innerHTML = '';
-      if (myPlayer && myPlayer.cards) {
-        myPlayer.cards.forEach((cObj, idx) => {
-          let faceUp = gameState.phase === 'GAME_OVER' || cObj.faceUp || (gameState.phase === 'PEEKING' && selectedPeek.includes(idx));
-          let clickHandler = '';
-          if (gameState.phase === 'PEEKING' && !myPlayer.hasPeeked) {
-            clickHandler = `onclick="togglePeek(${idx})"`;
-          } else if (gameState.phase === 'PLAYING' && gameState.playerOrder[gameState.turnIndex] === myUserId && gameState.drawnCard) {
-            clickHandler = `onclick="swapCard(${idx})"`;
-          } else if (gameState.phase === 'PLAYING' && gameState.playerOrder[gameState.turnIndex] === myUserId && !gameState.drawnCard) {
-            clickHandler = `onclick="reflexCut(${idx})"`;
-          }
-          const wrapper = document.createElement('div');
-          wrapper.className = "flex flex-col items-center gap-1";
-          wrapper.innerHTML = renderCard(cObj.card, faceUp, clickHandler);
-          myHandGrid.appendChild(wrapper);
-        });
-      }
+      <header className="bg-slate-900 border-b border-slate-800 px-4 py-3 flex justify-between items-center shadow-md">
+        <h1 className="font-black text-amber-400 tracking-wider">TAMOUL {roomId && <span className="text-xs text-slate-400">({roomId})</span>}</h1>
+        <div className="flex items-center gap-3">
+          <button 
+            onClick={() => setShowGameRulesModal(true)}
+            className="bg-slate-800 hover:bg-slate-700 text-amber-400 text-xs font-bold px-3 py-1.5 border border-slate-700 transition"
+          >
+            📖 Règles & Valeurs
+          </button>
+        </div>
+      </header>
 
-      const peekArea = document.getElementById('peekingActionArea');
-      const btnPeek = document.getElementById('btnFinishPeeking');
-      if (gameState.phase === 'PEEKING' && myPlayer && !myPlayer.hasPeeked) {
-        peekArea.style.display = 'block';
-        if (selectedPeek.length === 2) {
-          btnPeek.disabled = false;
-          btnPeek.className = 'bg-amber-500 hover:bg-amber-400 text-slate-950 px-6 py-2 text-xs font-bold uppercase cursor-pointer shadow rounded';
-        } else {
-          btnPeek.disabled = true;
-          btnPeek.className = 'bg-slate-800 text-slate-600 px-6 py-2 text-xs font-bold uppercase cursor-not-allowed rounded';
-        }
-      } else {
-        peekArea.style.display = 'none';
-      }
-    }
+      {!inRoom ? (
+        <div className="flex-1 flex flex-col items-center justify-center p-4">
+          <div className="w-full max-w-md bg-slate-900/90 border border-slate-700 p-6 sm:p-8 shadow-2xl flex flex-col items-center">
+            <h2 className="text-3xl font-black text-amber-400 tracking-wider mb-2">TAMOUL</h2>
+            <p className="text-xs text-slate-400 mb-6">Jeu de cartes multijoueur en ligne</p>
 
-    function togglePeek(idx) {
-      if (selectedPeek.includes(idx)) {
-        selectedPeek = selectedPeek.filter(i => i !== idx);
-      } else if (selectedPeek.length < 2) {
-        selectedPeek.push(idx);
-      }
-      renderGame();
-    }
+            {errorMessage && (
+              <div className="w-full bg-red-600/30 border border-red-500 text-red-200 text-xs p-3 mb-4">
+                {errorMessage}
+              </div>
+            )}
 
-    function finishPeeking() {
-      const myPlayer = gameState.players[myUserId];
-      myPlayer.hasPeeked = true;
-      selectedPeek = [];
-      
-      const allDone = Object.values(gameState.players).every(p => p.hasPeeked);
-      if (allDone) {
-        gameState.phase = 'PLAYING';
-      }
-      saveAndSync();
-    }
+            <div className="w-full space-y-4">
+              <div>
+                <label className="block text-xs font-bold uppercase text-slate-400 mb-1">Votre Pseudo</label>
+                <input
+                  type="text"
+                  maxLength={15}
+                  placeholder="Ex: Alex"
+                  value={playerName}
+                  onChange={(e) => setPlayerName(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-700 px-4 py-3 text-white focus:outline-none focus:border-amber-400"
+                />
+              </div>
 
-    function drawCard() {
-      if (gameState.phase !== 'PLAYING') return;
-      if (gameState.playerOrder[gameState.turnIndex] !== myUserId) return;
-      if (gameState.drawnCard) return;
+              <button
+                onClick={handleCreateRoom}
+                className="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-3 transition shadow"
+              >
+                Créer un nouveau salon
+              </button>
 
-      playCardSound();
-      if (gameState.deck.length === 0) {
-        const top = gameState.discardPile.pop();
-        gameState.deck = [...gameState.discardPile];
-        gameState.discardPile = [top];
-      }
-      gameState.drawnCard = gameState.deck.pop();
-      saveAndSync();
-    }
+              <div className="relative flex py-2 items-center">
+                <div className="flex-grow border-t border-slate-700"></div>
+                <span className="flex-shrink mx-4 text-xs text-slate-500 uppercase">OU</span>
+                <div className="flex-grow border-t border-slate-700"></div>
+              </div>
 
-    function swapCard(idx) {
-      playCardSound();
-      const myPlayer = gameState.players[myUserId];
-      const old = myPlayer.cards[idx];
-      myPlayer.cards[idx] = { card: gameState.drawnCard, faceUp: false };
-      gameState.discardPile.push(old.card);
-      gameState.drawnCard = null;
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  placeholder="CODE SALON"
+                  value={roomId}
+                  onChange={(e) => setRoomId(e.target.value.toUpperCase())}
+                  onKeyDown={(e) => { if (e.key === 'Enter') handleJoinRoom(); }}
+                  className="w-full bg-slate-950 border border-slate-700 px-4 py-3 text-white uppercase font-mono tracking-widest text-center focus:outline-none focus:border-amber-400"
+                />
+                <button
+                  onClick={handleJoinRoom}
+                  className="bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold px-6 py-3 transition shadow"
+                >
+                  Entrer
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : roomData && roomData.gameState === 'LOBBY' ? (
+        <div className="flex-1 flex flex-col items-center justify-center p-4">
+          <div className="w-full max-w-lg bg-slate-900/90 border border-slate-700 p-6 sm:p-8 shadow-2xl">
+            <h2 className="text-xl font-bold text-amber-400 mb-4">Salon d'attente</h2>
+            
+            <div className="bg-slate-950 border border-slate-700 p-4 mb-4 text-center">
+              <p className="text-xs text-slate-400 mb-1">Code du salon à partager :</p>
+              <span className="text-3xl font-black tracking-widest text-amber-400 font-mono">{roomId}</span>
+            </div>
 
-      nextTurn();
-    }
+            <div className="w-full mb-6">
+              <button
+                onClick={copyInviteLink}
+                className="w-full bg-blue-600 hover:bg-blue-500 text-white font-bold py-2.5 text-xs uppercase tracking-wider transition flex items-center justify-center gap-2 shadow"
+              >
+                📋 Copier le lien d'invitation direct
+              </button>
+              {copyFeedback && <p className="text-center text-[10px] text-emerald-400 mt-1">Lien copié dans le presse-papier !</p>}
+            </div>
 
-    function discardDrawn() {
-      playCardSound();
-      gameState.discardPile.push(gameState.drawnCard);
-      gameState.drawnCard = null;
-      nextTurn();
-    }
+            <div className="mb-6 space-y-2">
+              <p className="text-xs font-bold uppercase text-slate-400">Joueurs connectés ({Object.values(roomData.players).length})</p>
+              {Object.values(roomData.players).map(p => (
+                <div key={p.id} className="bg-slate-950 border border-slate-800 px-4 py-3 flex justify-between items-center">
+                  <span className="font-bold">{p.name} {p.id === roomData.hostId && '(Hôte)'}</span>
+                  {p.id === userId && <span className="text-xs text-emerald-400 font-bold">Vous</span>}
+                </div>
+              ))}
+            </div>
 
-    function reflexCut(idx) {
-      playCardSound();
-      const topDiscard = gameState.discardPile[gameState.discardPile.length - 1];
-      const myPlayer = gameState.players[myUserId];
-      const target = myPlayer.cards[idx];
+            {roomData.hostId === userId ? (
+              <button
+                onClick={handleStartGame}
+                disabled={Object.values(roomData.players).length < 2}
+                className={`w-full py-3 font-bold uppercase tracking-wider transition ${Object.values(roomData.players).length >= 2 ? 'bg-emerald-600 hover:bg-emerald-500 text-white' : 'bg-slate-800 text-slate-500 cursor-not-allowed'}`}
+              >
+                {Object.values(roomData.players).length >= 2 ? 'Lancer la partie' : 'En attente d\'un 2e joueur...'}
+              </button>
+            ) : (
+              <p className="text-center text-sm text-slate-400 italic">En attente que l'hôte lance la partie...</p>
+            )}
+          </div>
+        </div>
+      ) : (
+        <div className="flex-1 p-4 flex flex-col justify-between items-center">
+          <div className="w-full max-w-5xl flex flex-wrap justify-center gap-4 my-2">
+            {roomData?.playerOrder.filter(id => id !== userId).map(pId => {
+              const p = roomData.players[pId];
+              const isTurn = roomData.playerOrder[roomData.currentTurnIndex] === pId;
+              const canTarget = activePower === 'SWAP_SELECT_TARGET_CARD';
 
-      if (target.card.val === topDiscard.val) {
-        myPlayer.cards.splice(idx, 1);
-        gameState.discardPile.push(target.card);
-      } else {
-        target.faceUp = true;
-        if (gameState.deck.length > 0) {
-          myPlayer.cards.push({ card: gameState.deck.pop(), faceUp: false });
-        }
-      }
-      saveAndSync();
-    }
+              return (
+                <div key={p.id} className={`bg-slate-900/90 border ${isTurn ? 'border-amber-400' : 'border-slate-800'} p-3 flex flex-col items-center`}>
+                  <p className="text-xs font-bold text-slate-300 mb-2">{p.name} {isTurn && '⭐'}</p>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    {p.cards.map((cObj, idx) => (
+                      <div key={idx}>
+                        {renderCard(
+                          cObj.card,
+                          cObj.isFaceUp || roomData.gameState === 'GAME_OVER',
+                          canTarget ? () => handleCardClickWithPower(idx, p.id) : null,
+                          canTarget ? "hover:ring-2 hover:ring-blue-400 cursor-pointer" : ""
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
 
-    function callTamoul() {
-      gameState.phase = 'GAME_OVER';
-      saveAndSync();
-    }
+          <div className="my-6 flex items-center gap-6">
+            <div className="flex flex-col items-center">
+              <span className="text-[10px] uppercase text-slate-400 mb-1">Pioche ({roomData?.deck?.length || 0})</span>
+              {renderCard(
+                { id: 'b' },
+                false,
+                (roomData?.playerOrder[roomData.currentTurnIndex] === userId && roomData?.gameState === 'PLAYING' && !roomData?.drawnCard && !activePower) ? handleDrawFromDeck : null,
+                (roomData?.playerOrder[roomData.currentTurnIndex] === userId && roomData?.gameState === 'PLAYING' && !roomData?.drawnCard && !activePower) ? "ring-2 ring-emerald-400 hover:scale-105" : ""
+              )}
+            </div>
 
-    function nextTurn() {
-      gameState.turnIndex = (gameState.turnIndex + 1) % gameState.playerOrder.length;
-      saveAndSync();
-    }
-  </script>
-</body>
-</html>
+            <div className="flex flex-col items-center">
+              <span className="text-[10px] uppercase text-slate-400 mb-1">Défausse</span>
+              {roomData?.discardPile[roomData.discardPile.length - 1] ? renderCard(roomData.discardPile[roomData.discardPile.length - 1], true) : <div className="w-16 h-24 border border-dashed border-slate-700"></div>}
+            </div>
+
+            {roomData?.drawnCard && roomData?.playerOrder[roomData.currentTurnIndex] === userId && (
+              <div className="flex flex-col items-center">
+                <span className="text-[10px] uppercase text-amber-400 mb-1">Piochée</span>
+                {renderCard(roomData.drawnCard, true, null, "ring-2 ring-amber-400")}
+                <button onClick={handleDiscardDrawn} className="mt-2 bg-red-600 hover:bg-red-500 text-white text-xs font-bold px-2 py-1">Défausser</button>
+              </div>
+            )}
+          </div>
+
+          {activePower && roomData?.playerOrder[roomData.currentTurnIndex] === userId && (
+            <div className="bg-amber-500/25 border border-amber-500 p-3 mb-4 text-center max-w-md">
+              <p className="text-xs font-bold text-amber-300 mb-2">
+                {activePower === 'PEEK_OWN' && "Regardez une carte de votre jeu :"}
+                {activePower === 'SWAP_SELECT_MY_CARD' && "Choisissez votre carte à échanger :"}
+                {activePower === 'SWAP_SELECT_TARGET_CARD' && "Choisissez la carte d'un adversaire :"}
+              </p>
+              <button onClick={skipPower} className="bg-slate-800 hover:bg-slate-700 text-white text-xs font-bold px-4 py-1.5 border border-slate-600">Passer le pouvoir</button>
+            </div>
+          )}
+
+          {roomData?.players[userId] && (
+            <div className="w-full max-w-md bg-slate-900/95 border border-slate-700 p-4 flex flex-col items-center shadow-2xl">
+              <div className="w-full flex justify-between items-center mb-3">
+                <span className="text-xs font-bold text-amber-400 uppercase">Vos cartes</span>
+                {roomData?.gameState === 'PLAYING' && roomData?.tamoulCalledBy === null && !activePower && (
+                  <button onClick={handleCallTamoul} className="bg-red-600 hover:bg-red-500 text-white font-black text-xs px-3 py-1 shadow">🔔 TAMOUL</button>
+                )}
+              </div>
+
+              <div className="grid grid-cols-2 gap-3 my-2">
+                {roomData.players[userId].cards.map((cObj, idx) => {
+                  const isPeekSelected = selectedPeekCards.includes(idx);
+                  const isFaceUp = (roomData?.gameState === 'PEEKING' && isPeekSelected) || roomData?.gameState === 'GAME_OVER' || cObj.isFaceUp;
+
+                  return (
+                    <div key={idx} className="flex flex-col items-center gap-1">
+                      {renderCard(
+                        cObj.card,
+                        isFaceUp,
+                        () => {
+                          if (activePower === 'PEEK_OWN' || activePower === 'SWAP_SELECT_MY_CARD') {
+                            handleCardClickWithPower(idx);
+                          } else if (roomData?.gameState === 'PEEKING' && !roomData.players[userId].hasPeeked) {
+                            if (selectedPeekCards.includes(idx)) setSelectedPeekCards(selectedPeekCards.filter(i => i !== idx));
+                            else if (selectedPeekCards.length < 2) setSelectedPeekCards([...selectedPeekCards, idx]);
+                          } else if (roomData?.playerOrder[roomData.currentTurnIndex] === userId && roomData?.drawnCard && !activePower) {
+                            handleSwapDrawnWithHand(idx);
+                          }
+                        },
+                        isPeekSelected ? "ring-2 ring-amber-400" : (activePower ? "ring-2 ring-orange-400" : "")
+                      )}
+
+                      {roomData?.gameState === 'PLAYING' && !roomData?.drawnCard && !activePower && (
+                        <button onClick={() => handleReflexCut(idx)} className="text-[10px] bg-slate-950 hover:bg-slate-800 text-orange-400 font-bold px-2 py-0.5 border border-slate-700">⚡ Couper</button>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+
+              {roomData?.gameState === 'PEEKING' && !roomData.players[userId].hasPeeked && (
+                <button
+                  disabled={selectedPeekCards.length !== 2}
+                  onClick={handleFinishPeeking}
+                  className={`mt-3 px-6 py-2 text-xs font-bold uppercase transition ${selectedPeekCards.length === 2 ? 'bg-amber-500 hover:bg-amber-400 text-slate-950 shadow' : 'bg-slate-800 text-slate-600 cursor-not-allowed'}`}
+                >
+                  Mémoriser ({selectedPeekCards.length}/2)
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {roomData?.gameState === 'GAME_OVER' && (
+        <div className="fixed inset-0 bg-black/90 z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-700 p-6 max-w-md w-full text-center shadow-2xl">
+            <h2 className="text-2xl font-black text-amber-400 mb-4">🏆 Fin de Partie !</h2>
+            <div className="space-y-2 mb-6">
+              {Object.values(roomData.players).sort((a,b)=>a.score-b.score).map((p, rank)=>(
+                <div key={p.id} className="bg-slate-950 border border-slate-800 p-3 flex justify-between items-center">
+                  <span className="font-bold">{rank+1}. {p.name}</span>
+                  <span className="text-amber-400 font-mono font-bold">{p.score} pts</span>
+                </div>
+              ))}
+            </div>
+            {roomData.hostId === userId && (
+              <button onClick={handleStartGame} className="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-3 transition">Rejouer une partie</button>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
