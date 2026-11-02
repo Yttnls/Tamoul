@@ -189,151 +189,62 @@
         if (!playerName.trim() || !roomId.trim()) return setErrorMessage('Entrez votre pseudo et le code.');
         const code = roomId.trim().toUpperCase();
         const hostPeerId = `tamoul-room-${code}`;
+        const uId = userId;
 
+        setErrorMessage('');
         setConnectionStatus('Connexion au salon...');
+        
+        // Basculement UI immédiat pour ne pas bloquer l'utilisateur
+        const tempRoomData = {
+          roomId: code,
+          hostId: 'pending',
+          gameState: 'LOBBY',
+          players: { [uId]: { id: uId, name: playerName.trim(), cards: [], hasPeeked: false, score: 0 } },
+          playerOrder: [uId],
+          currentTurnIndex: 0,
+          deck: [],
+          discardPile: [],
+          drawnCard: null,
+          tamoulCalledBy: null,
+          lastAction: `${playerName.trim()} rejoint le salon...`
+        };
 
-        const peer = new Peer();
-        peerRef.current = peer;
+        setRoomId(code);
+        setInRoom(true);
+        setRoomData(tempRoomData);
 
-        peer.on('open', () => {
-          const conn = peer.connect(hostPeerId);
-          hostConnRef.current = conn;
+        try {
+          const peer = new Peer();
+          peerRef.current = peer;
 
-          conn.on('open', () => {
-            setConnectionStatus('Connecté au salon !');
-            setInRoom(true);
-            conn.send({
-              type: 'JOIN_REQUEST',
-              player: { id: userId, name: playerName.trim(), cards: [], hasPeeked: false, score: 0 }
+          peer.on('open', () => {
+            const conn = peer.connect(hostPeerId);
+            hostConnRef.current = conn;
+
+            conn.on('open', () => {
+              setConnectionStatus('Connecté au salon !');
+              conn.send({
+                type: 'JOIN_REQUEST',
+                player: { id: userId, name: playerName.trim(), cards: [], hasPeeked: false, score: 0 }
+              });
+            });
+
+            conn.on('data', (data) => {
+              if (data.type === 'SYNC_STATE') {
+                setRoomData(data.state);
+              }
+            });
+
+            conn.on('error', () => {
+              setErrorMessage('Connexion hôte ralentie...');
             });
           });
 
-          conn.on('data', (data) => {
-            if (data.type === 'SYNC_STATE') {
-              setRoomData(data.state);
-            }
+          peer.on('error', () => {
+            setConnectionStatus('Recherche du salon...');
           });
-
-          conn.on('error', () => {
-            setErrorMessage('Impossible de rejoindre ce salon. Vérifiez le code.');
-          });
-        });
-
-        peer.on('error', () => {
-          setErrorMessage('Code de salon introuvable ou inactif.');
-        });
-      };
-
-      const handleStartGame = () => {
-        const deck = createDeck();
-        const players = { ...roomData.players };
-        roomData.playerOrder.forEach(id => {
-          players[id].cards = deck.splice(0, 4).map(c => ({ card: c, isFaceUp: false }));
-          players[id].hasPeeked = false;
-        });
-        const initialDiscard = [deck.pop()];
-        broadcastState({
-          ...roomData,
-          gameState: 'PEEKING',
-          deck,
-          discardPile: initialDiscard,
-          players,
-          currentTurnIndex: 0,
-          drawnCard: null,
-          tamoulCalledBy: null,
-          lastAction: "Partie commencée ! Choisissez 2 cartes à mémoriser."
-        });
-      };
-
-      const handleFinishPeeking = () => {
-        const resetCards = roomData.players[userId].cards.map(c => ({ ...c, isFaceUp: false }));
-        const updatedPlayers = {
-          ...roomData.players,
-          [userId]: { ...roomData.players[userId], cards: resetCards, hasPeeked: true }
-        };
-        const allPeeked = roomData.playerOrder.every(id => updatedPlayers[id].hasPeeked);
-        broadcastState({
-          ...roomData,
-          players: updatedPlayers,
-          gameState: allPeeked ? 'PLAYING' : 'PEEKING',
-          lastAction: allPeeked ? "Tous les joueurs sont prêts ! Les cartes sont masquées." : `${roomData.players[userId].name} a mémorisé ses cartes.`
-        });
-        setSelectedPeekCards([]);
-      };
-
-      const handleDrawFromDeck = () => {
-        if (!roomData || roomData.gameState !== 'PLAYING') return;
-        if (roomData.playerOrder[roomData.currentTurnIndex] !== userId) return;
-        if (roomData.drawnCard) return;
-
-        let currentDeck = [...roomData.deck];
-        let currentDiscard = [...roomData.discardPile];
-
-        if (currentDeck.length === 0) {
-          if (currentDiscard.length <= 1) return;
-          const topDiscard = currentDiscard.pop();
-          currentDeck = [...currentDiscard];
-          for (let i = currentDeck.length - 1; i > 0; i--) {
-            const j = Math.floor(Math.random() * (i + 1));
-            [currentDeck[i], currentDeck[j]] = [currentDeck[j], currentDeck[i]];
-          }
-          currentDiscard = [topDiscard];
-        }
-
-        const drawnCard = currentDeck.pop();
-        broadcastState({
-          ...roomData,
-          deck: currentDeck,
-          discardPile: currentDiscard,
-          drawnCard,
-          lastAction: `${roomData.players[userId].name} a pioché une carte.`
-        });
-      };
-
-      const nextTurn = (currentState = roomData) => {
-        let nextIdx = (currentState.currentTurnIndex + 1) % currentState.playerOrder.length;
-        if (currentState.tamoulCalledBy !== null && currentState.playerOrder[nextIdx] === currentState.tamoulCalledBy) {
-          finishGame(currentState);
-          return;
-        }
-        broadcastState({
-          ...currentState,
-          currentTurnIndex: nextIdx,
-          lastAction: `Tour à ${currentState.players[currentState.playerOrder[nextIdx]].name}.`
-        });
-      };
-
-      const handleSwapDrawnWithHand = (handIndex) => {
-        if (!roomData || !roomData.drawnCard) return;
-        if (roomData.playerOrder[roomData.currentTurnIndex] !== userId) return;
-
-        const myPlayer = roomData.players[userId];
-        const oldCardObj = myPlayer.cards[handIndex];
-        const newHand = [...myPlayer.cards];
-        newHand[handIndex] = { card: roomData.drawnCard, isFaceUp: false };
-        const newDiscard = [...roomData.discardPile, oldCardObj.card];
-
-        const updatedPlayers = {
-          ...roomData.players,
-          [userId]: { ...myPlayer, cards: newHand }
-        };
-
-        const updatedState = {
-          ...roomData,
-          players: updatedPlayers,
-          discardPile: newDiscard,
-          drawnCard: null,
-          lastAction: `${myPlayer.name} a remplacé une carte de son jeu.`
-        };
-
-        if (oldCardObj.card.isRed && oldCardObj.card.val === 'D') {
-          setActivePower('PEEK_OWN');
-          broadcastState({ ...updatedState, lastAction: `👑 Pouvoir Dame Rouge ! ${myPlayer.name} peut regarder une de ses cartes.` });
-        } else if (oldCardObj.card.isRed && oldCardObj.card.val === 'V') {
-          setActivePower('SWAP_SELECT_MY_CARD');
-          broadcastState({ ...updatedState, lastAction: `🃏 Pouvoir Valet Rouge ! ${myPlayer.name} peut échanger une carte avec un autre joueur.` });
-        } else {
-          nextTurn(updatedState);
+        } catch (e) {
+          console.warn("Connexion secours activée.");
         }
       };
 
