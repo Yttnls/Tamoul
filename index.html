@@ -1,4 +1,22 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
+import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+import { getAuth, signInAnonymously } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+import { getFirestore, doc, setDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+// Définition / Configuration Firestore
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'tamoul-game-app';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {
+  apiKey: "AIzaSyDemoKeyOnlyForFallback",
+  authDomain: "tamoul-app.firebaseapp.com",
+  projectId: "tamoul-app",
+  storageBucket: "tamoul-app.appspot.com",
+  messagingSenderId: "123456789",
+  appId: "1:123456789:web:abcdef"
+};
+
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
+const auth = getAuth(app);
 
 const SUITS = ['♠', '♣', '♥', '♦'];
 const VALUES = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'V', 'D', 'R'];
@@ -95,6 +113,7 @@ export default function App() {
   const [roomData, setRoomData] = useState(null);
   const [errorMessage, setErrorMessage] = useState('');
   const [copyFeedback, setCopyFeedback] = useState(false);
+  const [user, setUser] = useState(null);
 
   const [showIntroRules, setShowIntroRules] = useState(true);
   const [showGameRulesModal, setShowGameRulesModal] = useState(false);
@@ -104,26 +123,41 @@ export default function App() {
   const [swapMyCardIndex, setSwapMyCardIndex] = useState(null);
   const [selectedPeekCards, setSelectedPeekCards] = useState([]);
 
-  const peerRef = useRef(null);
-  const connRef = useRef(null);
-  const hostConnsRef = useRef({});
-
+  // Authentification anonyme Firebase au chargement
   useEffect(() => {
+    signInAnonymously(auth).then((cred) => {
+      setUser(cred.user);
+    }).catch(() => {
+      setUser({ uid: userId });
+    });
+
     if (typeof window !== 'undefined') {
       const params = new URLSearchParams(window.location.search);
       const salonParam = params.get('salon');
       if (salonParam) {
         setRoomId(salonParam.toUpperCase());
       }
-
-      if (!window.Peer) {
-        const script = document.createElement('script');
-        script.src = 'https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js';
-        script.async = true;
-        document.body.appendChild(script);
-      }
     }
   }, []);
+
+  // Écoute temps réel du salon via Cloud Firestore
+  useEffect(() => {
+    if (!inRoom || !roomId) return;
+
+    const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomId);
+    const unsubscribe = onSnapshot(roomRef, (snapshot) => {
+      if (snapshot.exists()) {
+        const data = snapshot.data();
+        setRoomData(data);
+      } else {
+        setErrorMessage("Le salon a été fermé ou n'existe pas.");
+      }
+    }, (error) => {
+      console.error("Erreur sync salon:", error);
+    });
+
+    return () => unsubscribe();
+  }, [inRoom, roomId]);
 
   const copyInviteLink = () => {
     if (typeof window === 'undefined') return;
@@ -142,124 +176,72 @@ export default function App() {
     document.body.removeChild(textArea);
   };
 
-  const broadcastState = (newState) => {
-    setRoomData(newState);
-    if (peerRef.current && newState.hostId === userId) {
-      Object.values(hostConnsRef.current).forEach(c => {
-        if (c && c.open) {
-          c.send({ type: 'UPDATE_STATE', roomData: newState });
-        }
-      });
-    } else if (connRef.current && connRef.current.open) {
-      connRef.current.send({ type: 'UPDATE_STATE', roomData: newState });
+  const updateRoomStateInCloud = async (newState) => {
+    if (!roomId) return;
+    try {
+      const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomId);
+      await setDoc(roomRef, newState, { merge: true });
+    } catch (err) {
+      console.error("Erreur mise à jour cloud:", err);
     }
   };
 
-  const handleCreateRoom = () => {
+  const handleCreateRoom = async () => {
     if (!playerName.trim()) {
       setErrorMessage('Veuillez entrer un pseudo.');
       return;
     }
-    const PeerClass = typeof window !== 'undefined' && window.Peer ? window.Peer : null;
-    if (!PeerClass) {
-      setErrorMessage('Réseau P2P en chargement, réessayez dans un instant.');
-      return;
-    }
     const code = Math.random().toString(36).substring(2, 8).toUpperCase();
-    const peerId = `tamoul_room_${code}`;
+    const initial = {
+      roomId: code,
+      hostId: userId,
+      gameState: 'LOBBY',
+      players: { [userId]: { id: userId, name: playerName.trim(), cards: [], hasPeeked: false, score: 0 } },
+      playerOrder: [userId],
+      currentTurnIndex: 0,
+      deck: [],
+      discardPile: [],
+      drawnCard: null,
+      tamoulCalledBy: null,
+      lastAction: `${playerName.trim()} a créé le salon (${code}).`
+    };
 
-    if (peerRef.current) peerRef.current.destroy();
-
-    try {
-      const peer = new PeerClass(peerId, { debug: 1 });
-      peerRef.current = peer;
-
-      peer.on('open', () => {
-        const initial = {
-          roomId: code,
-          hostId: userId,
-          gameState: 'LOBBY',
-          players: { [userId]: { id: userId, name: playerName.trim(), cards: [], hasPeeked: false, score: 0 } },
-          playerOrder: [userId],
-          currentTurnIndex: 0,
-          deck: [],
-          discardPile: [],
-          drawnCard: null,
-          tamoulCalledBy: null,
-          lastAction: `${playerName.trim()} a créé le salon (${code}).`
-        };
-        setRoomId(code);
-        setRoomData(initial);
-        setInRoom(true);
-        setErrorMessage('');
-      });
-
-      peer.on('error', (err) => {
-        setErrorMessage(`Erreur réseau P2P: ${err.type || 'Salon en cours'}`);
-      });
-
-      peer.on('connection', (conn) => {
-        hostConnsRef.current[conn.peer] = conn;
-
-        conn.on('data', (data) => {
-          if (data.type === 'JOIN_REQUEST') {
-            const newPlayer = data.player;
-            setRoomData(prev => {
-              if (!prev) return prev;
-              const updatedPlayers = { ...prev.players, [newPlayer.id]: newPlayer };
-              const updatedOrder = prev.playerOrder.includes(newPlayer.id) ? prev.playerOrder : [...prev.playerOrder, newPlayer.id];
-              const updatedState = { ...prev, players: updatedPlayers, playerOrder: updatedOrder, lastAction: `${newPlayer.name} a rejoint le salon.` };
-              broadcastState(updatedState);
-              return updatedState;
-            });
-          } else if (data.type === 'UPDATE_STATE') {
-            broadcastState(data.roomData);
-          }
-        });
-      });
-    } catch (err) {
-      setErrorMessage('Erreur lors de la création du salon.');
-    }
+    setRoomId(code);
+    setInRoom(true);
+    setErrorMessage('');
+    await updateRoomStateInCloud(initial);
   };
 
-  const handleJoinRoom = () => {
+  const handleJoinRoom = async () => {
     if (!playerName.trim() || !roomId.trim()) {
       setErrorMessage('Veuillez renseigner votre pseudo et le code du salon.');
       return;
     }
-    const PeerClass = typeof window !== 'undefined' && window.Peer ? window.Peer : null;
-    if (!PeerClass) {
-      setErrorMessage('Réseau P2P en chargement, réessayez dans un instant.');
-      return;
-    }
     const code = roomId.trim().toUpperCase();
 
-    if (peerRef.current) peerRef.current.destroy();
-
     try {
-      const peer = new PeerClass({ debug: 1 });
-      peerRef.current = peer;
+      const newPlayerObj = { id: userId, name: playerName.trim(), cards: [], hasPeeked: false, score: 0 };
+      
+      setRoomId(code);
+      setInRoom(true);
+      setErrorMessage('');
 
-      peer.on('open', () => {
-        const conn = peer.connect(`tamoul_room_${code}`);
-        connRef.current = conn;
-
-        conn.on('open', () => {
-          const newPlayerObj = { id: userId, name: playerName.trim(), cards: [], hasPeeked: false, score: 0 };
-          conn.send({ type: 'JOIN_REQUEST', player: newPlayerObj });
-          setRoomId(code);
-          setInRoom(true);
-          setErrorMessage('');
+      if (roomData) {
+        const updatedPlayers = { ...roomData.players, [userId]: newPlayerObj };
+        const updatedOrder = roomData.playerOrder.includes(userId) ? roomData.playerOrder : [...roomData.playerOrder, userId];
+        await updateRoomStateInCloud({
+          ...roomData,
+          players: updatedPlayers,
+          playerOrder: updatedOrder,
+          lastAction: `${playerName.trim()} a rejoint le salon.`
         });
-
-        conn.on('error', () => {
-          setErrorMessage('Salon introuvable. Assurez-vous que l\'hôte a bien créé le salon.');
+      } else {
+        await updateRoomStateInCloud({
+          roomId: code,
+          players: { [userId]: newPlayerObj },
+          playerOrder: [userId]
         });
-      });
-
-      peer.on('error', () => {
-        setErrorMessage('Connexion impossible. Vérifiez le code salon.');
-      });
+      }
     } catch (err) {
       setErrorMessage('Erreur lors de la connexion au salon.');
     }
@@ -283,7 +265,7 @@ export default function App() {
       tamoulCalledBy: null,
       lastAction: "Partie lancée ! Choisissez 2 cartes à mémoriser."
     };
-    broadcastState(newState);
+    updateRoomStateInCloud(newState);
   };
 
   const handleFinishPeeking = () => {
@@ -303,7 +285,7 @@ export default function App() {
       lastAction: allPeeked ? "C'est parti ! Le premier joueur peut jouer." : `${myPlayer.name} a mémorisé ses cartes.`
     };
     setSelectedPeekCards([]);
-    broadcastState(newState);
+    updateRoomStateInCloud(newState);
   };
 
   const handleDrawFromDeck = () => {
@@ -326,7 +308,7 @@ export default function App() {
       drawnCard,
       lastAction: `${roomData.players[userId].name} a pioché une carte.`
     };
-    broadcastState(newState);
+    updateRoomStateInCloud(newState);
   };
 
   const nextTurn = (state = roomData) => {
@@ -344,7 +326,7 @@ export default function App() {
         gameState: 'GAME_OVER',
         lastAction: "La partie est terminée ! Affichage des résultats."
       };
-      broadcastState(endState);
+      updateRoomStateInCloud(endState);
       return;
     }
 
@@ -353,7 +335,7 @@ export default function App() {
       currentTurnIndex: nextIndex,
       lastAction: `Tour à ${state.players[nextPlayerId]?.name}`
     };
-    broadcastState(newState);
+    updateRoomStateInCloud(newState);
   };
 
   const handleSwapDrawnWithHand = (idx) => {
@@ -393,10 +375,10 @@ export default function App() {
   const triggerPower = (card, state) => {
     if (card.powerType === 'PEEK_OWN') {
       setActivePower('PEEK_OWN');
-      broadcastState({ ...state, lastAction: `${roomData.players[userId].name} a activé la Dame Rouge !` });
+      updateRoomStateInCloud({ ...state, lastAction: `${roomData.players[userId].name} a activé la Dame Rouge !` });
     } else if (card.powerType === 'SWAP') {
       setActivePower('SWAP_SELECT_MY_CARD');
-      broadcastState({ ...state, lastAction: `${roomData.players[userId].name} a activé le Valet Rouge !` });
+      updateRoomStateInCloud({ ...state, lastAction: `${roomData.players[userId].name} a activé le Valet Rouge !` });
     } else {
       nextTurn(state);
     }
@@ -460,7 +442,7 @@ export default function App() {
         discardPile: [...roomData.discardPile, playedCardObj.card],
         lastAction: `⚡ RÉFLEXE ! ${roomData.players[userId].name} a coupé une carte !`
       };
-      broadcastState(newState);
+      updateRoomStateInCloud(newState);
     } else {
       let deck = [...roomData.deck];
       let penalty = deck.length > 0 ? deck.pop() : null;
@@ -473,7 +455,7 @@ export default function App() {
         players: { ...roomData.players, [userId]: { ...roomData.players[userId], cards: myHand } },
         lastAction: `❌ Mauvais réflexe de ${roomData.players[userId].name} (Pénalité) !`
       };
-      broadcastState(newState);
+      updateRoomStateInCloud(newState);
       if (penalty) setPenaltyModal(penalty);
     }
   };
@@ -485,11 +467,11 @@ export default function App() {
       tamoulCalledBy: userId,
       lastAction: `🔔 TAMOUL annoncé par ${roomData.players[userId].name} ! Dernier tour.`
     };
-    broadcastState(newState);
+    updateRoomStateInCloud(newState);
   };
 
   const renderCard = (card, isFaceUp = true, onClick = null, extraClasses = "") => {
-    if (!card) return <div className="w-16 h-24 sm:w-20 sm:h-28 border border-dashed border-slate-700" style={{ borderRadius: 0 }}></div>;
+    if (!card) return <div className="w-16 h-24 sm:w-20 sm:h-28 border border-dashed border-slate-700 font-sans" style={{ borderRadius: 0 }}></div>;
     if (!isFaceUp) {
       return (
         <div onClick={onClick} className={`w-16 h-24 sm:w-20 sm:h-28 bg-slate-900 border-2 border-slate-600 flex items-center justify-center cursor-pointer shadow-lg transition relative select-none ${extraClasses}`} style={{ borderRadius: 0 }}>
@@ -754,7 +736,7 @@ export default function App() {
 
             <div className="flex flex-col items-center">
               <span className="text-[10px] uppercase text-slate-400 mb-1">Défausse</span>
-              {roomData?.discardPile[roomData.discardPile.length - 1] ? renderCard(roomData.discardPile[roomData.discardPile.length - 1], true) : <div className="w-16 h-24 border border-dashed border-slate-700"></div>}
+              {roomData?.discardPile[roomData.discardPile.length - 1] ? renderCard(roomData.discardPile[roomData.discardPile.length - 1], true) : <div className="w-16 h-24 border border-dashed border-slate-700 font-sans"></div>}
             </div>
 
             {roomData?.drawnCard && roomData?.playerOrder[roomData.currentTurnIndex] === userId && (
